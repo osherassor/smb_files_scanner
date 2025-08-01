@@ -294,7 +294,7 @@ class SMBScanner:
             r'\\Windows\\SoftwareDistribution\\Download\\',
             r'\\Windows\\Temp\\',
             r'\\Windows\\Installer\\',
-            r'\\Program Files( \(x86\))?\\',
+            '\\\\Program Files( \\(x86\\))?\\\\',
             r'\\Users\\[^\\]+\\AppData\\Local\\Temp\\',
             r'\\Users\\[^\\]+\\AppData\\Local\\Packages\\',
             r'\\Users\\[^\\]+\\AppData\\Local\\Microsoft\\WindowsApps\\',
@@ -313,7 +313,132 @@ class SMBScanner:
             r'\\languages\\',
             r'\\lang\\',
             r'\\i18n\\',
-            r'\\translations\\'
+            r'\\translations\\',
+            # Skip problematic Office directories
+            r'\\Office Setup Controller\\',
+            r'\\Office16\\',
+            r'\\Office15\\',
+            r'\\Office14\\',
+            r'\\Office13\\',
+            r'\\Office12\\',
+            r'\\Office11\\',
+            r'\\Office10\\',
+            r'\\Office9\\',
+            r'\\Office8\\',
+            r'\\Office7\\',
+            r'\\Office6\\',
+            r'\\Office5\\',
+            r'\\Office4\\',
+            r'\\Office3\\',
+            r'\\Office2\\',
+            r'\\Office1\\',
+            r'\\Office0\\',
+            # Skip documentation and license files
+            r'\\LICENSE(?:\.txt|\.md)?$',
+            r'\\CHANGELOG(?:\.txt|\.md)?$',
+            r'\\CHANGES(?:\.txt|\.md)?$',
+            r'\\RELEASE_NOTES(?:\.txt|\.md)?$',
+            r'\\RELEASES(?:\.txt|\.md)?$',
+            r'\\NEWS(?:\.txt|\.md)?$',
+            r'\\README(?:\.txt|\.md)?$',
+            r'\\COPYING(?:\.txt|\.md)?$',
+            r'\\AUTHORS(?:\.txt|\.md)?$',
+            r'\\CONTRIBUTORS(?:\.txt|\.md)?$',
+            r'\\CREDITS(?:\.txt|\.md)?$',
+            r'\\HISTORY(?:\.txt|\.md)?$',
+            r'\\TODO(?:\.txt|\.md)?$',
+            r'\\VERSION(?:\.txt|\.md)?$',
+            r'\\INSTALL(?:\.txt|\.md)?$',
+            r'\\DEPENDENCIES(?:\.txt|\.md)?$',
+            r'\\NOTICE(?:\.txt|\.md)?$',
+            r'\\THANKS(?:\.txt|\.md)?$',
+            r'\\BUGS(?:\.txt|\.md)?$',
+            r'\\FAQ(?:\.txt|\.md)?$',
+            r'\\MANUAL(?:\.txt|\.md)?$',
+            r'\\DOCUMENTATION(?:\.txt|\.md)?$',
+            r'\\HELP(?:\.txt|\.md)?$',
+            r'\\GUIDE(?:\.txt|\.md)?$',
+            r'\\TUTORIAL(?:\.txt|\.md)?$',
+            r'\\EXAMPLE(?:\.txt|\.md)?$',
+            r'\\SAMPLE(?:\.txt|\.md)?$',
+            r'\\DEMO(?:\.txt|\.md)?$',
+            r'\\TEST(?:\.txt|\.md)?$',
+            r'\\BUILD(?:\.txt|\.md)?$',
+            r'\\MAKE(?:\.txt|\.md)?$',
+            r'\\CONFIGURE(?:\.txt|\.md)?$',
+            r'\\SETUP(?:\.txt|\.md)?$',
+            r'\\INSTALLATION(?:\.txt|\.md)?$',
+            r'\\CONFIGURATION(?:\.txt|\.md)?$',
+            r'\\USAGE(?:\.txt|\.md)?$',
+            r'\\API(?:\.txt|\.md)?$',
+            r'\\REFERENCE(?:\.txt|\.md)?$',
+            r'\\SPECIFICATION(?:\.txt|\.md)?$',
+            r'\\PROTOCOL(?:\.txt|\.md)?$',
+            r'\\STANDARD(?:\.txt|\.md)?$',
+            r'\\COMPLIANCE(?:\.txt|\.md)?$',
+            r'\\CERTIFICATION(?:\.txt|\.md)?$',
+            r'\\VALIDATION(?:\.txt|\.md)?$',
+            r'\\VERIFICATION(?:\.txt|\.md)?$',
+            r'\\TESTING(?:\.txt|\.md)?$',
+            r'\\QUALITY(?:\.txt|\.md)?$',
+            r'\\SECURITY(?:\.txt|\.md)?$',
+            r'\\PRIVACY(?:\.txt|\.md)?$',
+            r'\\TERMS(?:\.txt|\.md)?$',
+            r'\\CONDITIONS(?:\.txt|\.md)?$',
+            r'\\AGREEMENT(?:\.txt|\.md)?$',
+            r'\\POLICY(?:\.txt|\.md)?$',
+            r'\\DISCLAIMER(?:\.txt|\.md)?$',
+            r'\\WARRANTY(?:\.txt|\.md)?$',
+            r'\\LIABILITY(?:\.txt|\.md)?$',
+            r'\\COPYRIGHT(?:\.txt|\.md)?$',
+            r'\\TRADEMARK(?:\.txt|\.md)?$',
+            r'\\PATENT(?:\.txt|\.md)?$',
+            r'\\INTELLECTUAL_PROPERTY(?:\.txt|\.md)?$',
+            r'\\LEGAL(?:\.txt|\.md)?$',
+            r'\\REGULATORY(?:\.txt|\.md)?$',
+            r'\\COMPLIANCE(?:\.txt|\.md)?$',
+            r'\\AUDIT(?:\.txt|\.md)?$',
+            r'\\REVIEW(?:\.txt|\.md)?$',
+            r'\\ASSESSMENT(?:\.txt|\.md)?$',
+            r'\\EVALUATION(?:\.txt|\.md)?$',
+            r'\\ANALYSIS(?:\.txt|\.md)?$',
+            r'\\REPORT(?:\.txt|\.md)?$',
+            r'\\SUMMARY(?:\.txt|\.md)?$',
+            r'\\OVERVIEW(?:\.txt|\.md)?$',
+            r'\\INTRODUCTION(?:\.txt|\.md)?$',
+            r'\\CONCLUSION(?:\.txt|\.md)?$',
+            r'\\APPENDIX(?:\.txt|\.md)?$',
+            r'\\GLOSSARY(?:\.txt|\.md)?$',
+            r'\\INDEX(?:\.txt|\.md)?$',
+            r'\\BIBLIOGRAPHY(?:\.txt|\.md)?$',
+            r'\\REFERENCES(?:\.txt|\.md)?$',
+            r'\\CITATIONS(?:\.txt|\.md)?$',
+            r'\\ACKNOWLEDGMENTS(?:\.txt|\.md)?$',
+            r'\\DEDICATION(?:\.txt|\.md)?$',
+            r'\\PREFACE(?:\.txt|\.md)?$',
+            r'\\FOREWORD(?:\.txt|\.md)?$',
+            r'\\AFTERWORD(?:\.txt|\.md)?$',
+            r'\\EPILOGUE(?:\.txt|\.md)?$',
+            r'\\PROLOGUE(?:\.txt|\.md)?$',
+            r'\\CHAPTER(?:\.txt|\.md)?$',
+            r'\\SECTION(?:\.txt|\.md)?$',
+            r'\\PARAGRAPH(?:\.txt|\.md)?$',
+            r'\\SENTENCE(?:\.txt|\.md)?$',
+            r'\\WORD(?:\.txt|\.md)?$',
+            r'\\CHARACTER(?:\.txt|\.md)?$',
+            r'\\BYTE(?:\.txt|\.md)?$',
+            r'\\BIT(?:\.txt|\.md)?$',
+            r'\\NIBBLE(?:\.txt|\.md)?$',
+            r'\\OCTET(?:\.txt|\.md)?$',
+            r'\\HEX(?:\.txt|\.md)?$',
+            r'\\BINARY(?:\.txt|\.md)?$',
+            r'\\DECIMAL(?:\.txt|\.md)?$',
+            r'\\OCTAL(?:\.txt|\.md)?$',
+            r'\\HEXADECIMAL(?:\.txt|\.md)?$',
+            r'\\BIN(?:\.txt|\.md)?$',
+            r'\\DEC(?:\.txt|\.md)?$',
+            r'\\OCT(?:\.txt|\.md)?$',
+            r'\\HEX(?:\.txt|\.md)?$'
         ]
         
         # Content regex patterns
@@ -469,12 +594,47 @@ class SMBScanner:
         if filename in self.exact_filenames:
             reasons.append("exact_filename")
         
-        # Content matches indicate HIGH level
+        # NEW PRIORITY LOGIC:
+        # HIGH Priority: CI/CD patterns, Passwords/Tokens, and specific sensitive files
+        high_priority_categories = ['Cloud', 'Secrets']
+        high_priority_files = {
+            'web.config', 'ntds.dit', 'sam', 'system', 'security', 'lsass.dmp', 
+            'memory.dmp', 'crash.dmp', 'minidump.dmp', 'id_rsa', 'id_ed25519', 
+            'id_dsa', 'id_ecdsa', 'authorized_keys', 'ssh_config', 'sshd_config',
+            'ssh_known_hosts', 'known_hosts', 'credentials', 'passwords.txt', 
+            'secrets.txt', 'tokens.txt', 'auth.json', 'auth.xml', 'login.conf',
+            'session.dat', 'config.ini', 'settings.json', 'preferences.xml',
+            'profile.dat', 'policy.xml', 'gpo.xml', 'registry.dat', 'security.dat'
+        }
+        
+        # Check for HIGH priority content matches
         if content_matches:
-            reasons.append("content_match")
+            for category in content_matches:
+                if category in high_priority_categories:
+                    reasons.append(f"high_priority_content_{category}")
+                    return InterestingLevel.HIGH, ",".join(reasons)
+        
+        # Check for HIGH priority files
+        if filename in high_priority_files:
+            reasons.append("high_priority_file")
             return InterestingLevel.HIGH, ",".join(reasons)
         
-        # Multiple indicators suggest MED level
+        # MEDIUM Priority: IP addresses and interesting domains
+        medium_priority_categories = ['Network_Addresses']
+        
+        # Check for MEDIUM priority content matches
+        if content_matches:
+            for category in content_matches:
+                if category in medium_priority_categories:
+                    reasons.append(f"medium_priority_content_{category}")
+                    return InterestingLevel.MED, ",".join(reasons)
+        
+        # LOW Priority: Everything else (Shadow_Files, Emails, Domain_Users, Hebrew, etc.)
+        if content_matches:
+            reasons.append("low_priority_content")
+            return InterestingLevel.LOW, ",".join(reasons)
+        
+        # Multiple indicators suggest MED level (if no content matches)
         if len(reasons) > 1:
             return InterestingLevel.MED, ",".join(reasons)
         elif len(reasons) == 1:
@@ -492,9 +652,31 @@ class SMBScanner:
         content_snippet = ""
         
         try:
+            # Check file size first to avoid processing extremely large files
+            file_size = os.path.getsize(filepath)
+            if file_size > 50 * 1024 * 1024:  # 50MB limit
+                return [], [], f"File too large ({self.format_size(file_size)}) - skipping content scan"
+            
             with open(filepath, 'rb') as f:
-                # Read first max_bytes
-                content = f.read(max_bytes)
+                # Read first max_bytes with timeout protection
+                try:
+                    import signal
+                    
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("File reading timeout")
+                    
+                    # Set timeout for file reading (30 seconds)
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(30)
+                    
+                    try:
+                        content = f.read(max_bytes)
+                    finally:
+                        signal.alarm(0)  # Cancel the alarm
+                        
+                except (TimeoutError, AttributeError):
+                    # Timeout or signal not available (Windows)
+                    content = f.read(max_bytes)
                 
                 # Check if file is binary by looking for null bytes or high ratio of non-printable characters
                 null_count = content.count(b'\x00')
@@ -515,37 +697,52 @@ class SMBScanner:
                 if printable_chars < len(text_content) * 0.7:  # Less than 70% printable characters
                     return [], [], "Binary file detected - skipping content scan"
                 
-                # Scan for patterns
+                # Scan for patterns with timeout protection
                 for category, patterns in self.content_regex.items():
                     for pattern in patterns:
-                        matches = pattern.findall(text_content)
-                        if matches:
-                            findings.append(f"{category}:{pattern.pattern}")
-                            # Store actual matched values, not just patterns
-                            for match in matches:
-                                if isinstance(match, tuple):
-                                    # Handle groups in regex
-                                    actual_value = f"{category}:{match[0] if match[0] else ' '.join(match)}"
-                                else:
-                                    actual_value = f"{category}:{match}"
-                                
-                                # Filter out false positives for Domain_Users
-                                if category == 'Domain_Users':
-                                    # Skip if it looks like code (contains common code patterns)
-                                    if any(code_pattern in actual_value.lower() for code_pattern in [
-                                        'document.', 'window.', 'function', 'var ', 'let ', 'const ',
-                                        'if ', 'for ', 'while ', 'return ', 'class ', 'import ',
-                                        'require', 'include', 'echo ', 'print ', 'console.',
-                                        'http', 'https', '.com', '.org', '.git', '.txt', '.php',
-                                        '<?php', '<!--', '//', '/*', '*/', 'function(', '()',
-                                        'length', 'push', 'pop', 'replace', 'split', 'join',
-                                        'addEventListener', 'onclick', 'onload', 'onchange'
-                                    ]):
-                                        continue
-                                
-                                # Only add if not already present (deduplicate)
-                                if actual_value not in actual_values:
-                                    actual_values.append(actual_value)
+                        try:
+                            # Set timeout for pattern matching (5 seconds per pattern)
+                            if hasattr(signal, 'SIGALRM'):
+                                signal.signal(signal.SIGALRM, timeout_handler)
+                                signal.alarm(5)
+                            
+                            try:
+                                matches = pattern.findall(text_content)
+                                if matches:
+                                    findings.append(f"{category}:{pattern.pattern}")
+                                    # Store actual matched values, not just patterns
+                                    for match in matches:
+                                        if isinstance(match, tuple):
+                                            # Handle groups in regex
+                                            actual_value = f"{category}:{match[0] if match[0] else ' '.join(match)}"
+                                        else:
+                                            actual_value = f"{category}:{match}"
+                                        
+                                        # Filter out false positives for Domain_Users
+                                        if category == 'Domain_Users':
+                                            # Skip if it looks like code (contains common code patterns)
+                                            if any(code_pattern in actual_value.lower() for code_pattern in [
+                                                'document.', 'window.', 'function', 'var ', 'let ', 'const ',
+                                                'if ', 'for ', 'while ', 'return ', 'class ', 'import ',
+                                                'require', 'include', 'echo ', 'print ', 'console.',
+                                                'http', 'https', '.com', '.org', '.git', '.txt', '.php',
+                                                '<?php', '<!--', '//', '/*', '*/', 'function(', '()',
+                                                'length', 'push', 'pop', 'replace', 'split', 'join',
+                                                'addEventListener', 'onclick', 'onload', 'onchange'
+                                            ]):
+                                                continue
+                                        
+                                        # Only add if not already present (deduplicate)
+                                        if actual_value not in actual_values:
+                                            actual_values.append(actual_value)
+                            finally:
+                                if hasattr(signal, 'SIGALRM'):
+                                    signal.alarm(0)  # Cancel the alarm
+                                    
+                        except TimeoutError:
+                            continue  # Skip this pattern if it takes too long
+                        except Exception:
+                            continue
                 
                 # Create snippet
                 if findings:
@@ -665,8 +862,10 @@ class SMBScanner:
             # Clear status line before printing result
             self.clear_status()
             
-            # Print colored output
-            self.print_result(result)
+            # Only print HIGH and MEDIUM priority results to console
+            # LOW priority results are still saved to results list and HTML summary
+            if result.interesting in ["HIGH", "MED"]:
+                self.print_result(result)
             
             return result
             
@@ -779,67 +978,97 @@ class SMBScanner:
             showing_directory_status = True
         
         try:
-            with os.scandir(full_path) as entries:
-                for entry in entries:
-                    # Check for skip request (always interactive)
-                    if self.keyboard_handler.check_for_skip():
-                        self.print_skip_message(current_path, target, share)
-                        self.keyboard_handler.reset_skip_flag()
-                        return
+            # Add timeout protection for directory scanning
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Directory scanning timeout")
+            
+            # Set timeout for directory scanning (60 seconds)
+            if hasattr(signal, 'SIGALRM'):
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(60)
+            
+            try:
+                with os.scandir(full_path) as entries:
+                    file_count = 0
+                    max_files_per_dir = 1000  # Limit files per directory to prevent getting stuck
                     
-                    try:
-                        # Skip if should be excluded
-                        if self.args.exclude_dirs:
-                            for pattern in self.args.exclude_dirs:
-                                if re.search(pattern, entry.name, re.IGNORECASE):
+                    for entry in entries:
+                        # Check for skip request (always interactive)
+                        if self.keyboard_handler.check_for_skip():
+                            self.print_skip_message(current_path, target, share)
+                            self.keyboard_handler.reset_skip_flag()
+                            return
+                        
+                        # Limit files per directory to prevent getting stuck
+                        if file_count >= max_files_per_dir:
+                            if self.args.verbose:
+                                print(f"⚠️  Directory {current_path} has too many files ({file_count}+) - skipping remaining files")
+                            break
+                        
+                        try:
+                            # Skip if should be excluded
+                            if self.args.exclude_dirs:
+                                for pattern in self.args.exclude_dirs:
+                                    if re.search(pattern, entry.name, re.IGNORECASE):
+                                        continue
+                            
+                            # Include only if specified
+                            if self.args.include_dirs:
+                                include_match = False
+                                for pattern in self.args.include_dirs:
+                                    if re.search(pattern, entry.name, re.IGNORECASE):
+                                        include_match = True
+                                        break
+                                if not include_match:
                                     continue
-                        
-                        # Include only if specified
-                        if self.args.include_dirs:
-                            include_match = False
-                            for pattern in self.args.include_dirs:
-                                if re.search(pattern, entry.name, re.IGNORECASE):
-                                    include_match = True
-                                    break
-                            if not include_match:
-                                continue
-                        
-                        relative_path = os.path.join(current_path, entry.name).replace('/', '\\')
-                        
-                        # Check if path should be skipped
-                        if self.should_skip_path(relative_path):
-                            continue
-                        
-                        if entry.is_file():
-                            # Check file extension filters
-                            ext = Path(entry.name).suffix.lower()
-                            if self.args.include_ext and ext not in self.args.include_ext:
-                                continue
-                            if self.args.exclude_ext and ext in self.args.exclude_ext:
+                            
+                            relative_path = os.path.join(current_path, entry.name).replace('/', '\\')
+                            
+                            # Check if path should be skipped
+                            if self.should_skip_path(relative_path):
                                 continue
                             
-                            # Clear directory status before scanning file
-                            if showing_directory_status:
-                                self.clear_status()
-                                showing_directory_status = False
+                            if entry.is_file():
+                                file_count += 1
+                                
+                                # Check file extension filters
+                                ext = Path(entry.name).suffix.lower()
+                                if self.args.include_ext and ext not in self.args.include_ext:
+                                    continue
+                                if self.args.exclude_ext and ext in self.args.exclude_ext:
+                                    continue
+                                
+                                # Clear directory status before scanning file
+                                if showing_directory_status:
+                                    self.clear_status()
+                                    showing_directory_status = False
+                                
+                                # Scan the file
+                                result = self.scan_file(target, share, entry.path, relative_path)
+                                if result:
+                                    with self.lock:
+                                        self.results.append(result)
                             
-                            # Scan the file
-                            result = self.scan_file(target, share, entry.path, relative_path)
-                            if result:
-                                with self.lock:
-                                    self.results.append(result)
+                            elif entry.is_dir() and not entry.is_symlink():
+                                # Recursively scan subdirectories
+                                self.scan_directory(target, share, root_path, relative_path, depth + 1)
                         
-                        elif entry.is_dir() and not entry.is_symlink():
-                            # Recursively scan subdirectories
-                            self.scan_directory(target, share, root_path, relative_path, depth + 1)
+                        except PermissionError:
+                            if self.args.verbose:
+                                print(f"Permission denied: {entry.path}")
+                        except Exception as e:
+                            if self.args.verbose:
+                                print(f"Error processing {entry.path}: {str(e)}")
+            
+            finally:
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)  # Cancel the alarm
                     
-                    except PermissionError:
-                        if self.args.verbose:
-                            print(f"Permission denied: {entry.path}")
-                    except Exception as e:
-                        if self.args.verbose:
-                            print(f"Error processing {entry.path}: {str(e)}")
-        
+        except TimeoutError:
+            if self.args.verbose:
+                print(f"⚠️  Directory scanning timeout for: {full_path}")
         except PermissionError:
             if self.args.verbose:
                 print(f"Permission denied accessing directory: {full_path}")
@@ -1211,6 +1440,9 @@ class SMBScanner:
             border-radius: 10px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
         }}
         .header {{
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -1250,6 +1482,52 @@ class SMBScanner:
             background: #f8f9fa;
             border-bottom: 1px solid #dee2e6;
         }}
+        .content-area {{
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }}
+        .summary-section {{
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+            border: 1px solid #dee2e6;
+        }}
+        .summary-section h2 {{
+            margin: 0 0 20px 0;
+            color: #495057;
+            font-size: 1.5em;
+        }}
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }}
+        .summary-item {{
+            text-align: center;
+            padding: 15px;
+            background: white;
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .summary-number {{
+            font-size: 2em;
+            font-weight: bold;
+            color: #495057;
+            margin-bottom: 5px;
+        }}
+        .summary-label {{
+            color: #6c757d;
+            font-size: 0.9em;
+        }}
+        .content-area h2 {{
+            color: #495057;
+            margin: 30px 0 20px 0;
+            font-size: 1.8em;
+            border-bottom: 2px solid #dee2e6;
+            padding-bottom: 10px;
+        }}
         .stat {{
             text-align: center;
         }}
@@ -1265,7 +1543,7 @@ class SMBScanner:
             letter-spacing: 1px;
         }}
         .asset-group {{
-            margin: 20px;
+            margin: 10px 0;
             border-radius: 8px;
             overflow: hidden;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
@@ -1305,13 +1583,16 @@ class SMBScanner:
             transition: max-height 0.3s ease-out;
         }}
         .asset-content.expanded {{
-            max-height: 2000px;
+            max-height: 600px;
+            overflow-y: auto;
         }}
         .priority-section {{
             margin: 15px;
             border-radius: 6px;
             overflow: hidden;
             border: 1px solid #e9ecef;
+            max-height: 400px;
+            overflow-y: auto;
         }}
         .priority-header {{
             padding: 12px 15px;
@@ -1421,7 +1702,32 @@ class SMBScanner:
             </div>
         </div>
         
-        {self._generate_asset_groups_html(asset_groups)}
+        <div class="content-area">
+            <div class="summary-section">
+                <h2>📊 Scan Summary</h2>
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <div class="summary-number">{len(high_results)}</div>
+                        <div class="summary-label">High Priority Files</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-number">{len(med_results)}</div>
+                        <div class="summary-label">Medium Priority Files</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-number">{len(low_results)}</div>
+                        <div class="summary-label">Low Priority Files</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-number">{len(self.results)}</div>
+                        <div class="summary-label">Total Files Scanned</div>
+                    </div>
+                </div>
+            </div>
+            
+            <h2>🔍 Detailed Findings by Category</h2>
+            {self._generate_asset_groups_html(asset_groups)}
+        </div>
         
         <div class="timestamp">
             Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -1451,7 +1757,7 @@ class SMBScanner:
             highPriorityGroups.forEach(group => {{
                 const hasHighPriority = group.querySelector('.priority-header.high');
                 if (hasHighPriority) {{
-                    const groupId = group.querySelector('.asset-header').getAttribute('onclick').match(/toggleAssetGroup\('([^']+)'\)/)[1];
+                    const groupId = group.querySelector('.asset-header').getAttribute('onclick').match(/toggleAssetGroup\\('([^']+)'\\)/)[1];
                     toggleAssetGroup(groupId);
                 }}
             }});
@@ -1507,8 +1813,7 @@ class SMBScanner:
         if self.args.password:
             command_parts.append(f'-p "{self.args.password}"')
         
-        if self.args.scan_contents:
-            command_parts.append('--scan-contents')
+
         
         if self.args.include_shares:
             command_parts.append(f'--include-shares "{self.args.include_shares}"')

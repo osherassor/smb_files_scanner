@@ -1,13 +1,2 @@
 colorama>=0.4.6
-tqdm>=4.65.0
-argparse
-pathlib
-re
-json
-csv
-datetime
-os
-stat
-threading
-xml.etree.ElementTree
-zipfile 
+tqdm>=4.65.0 
