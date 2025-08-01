@@ -58,16 +58,16 @@ tqdm>=4.65.0
 python smb_scanner.py --target 10.0.0.5
 
 # Scan specific share
-python smb_scanner.py --target \\\\10.0.0.5\\Users
+python smb_scanner.py --target \\10.0.0.5\Users
 
 # Scan specific path
-python smb_scanner.py --target \\\\10.0.0.5\\Users\\Public
+python smb_scanner.py --target \\10.0.0.5\Users\Public
 ```
 
 ### With Authentication
 ```bash
 # Domain authentication
-python smb_scanner.py --target 10.0.0.5 -u CORP\\alice -p "S3cret!"
+python smb_scanner.py --target 10.0.0.5 -u CORP\alice -p "S3cret!"
 
 # Local authentication
 python smb_scanner.py --target 10.0.0.5 -u administrator -p "password123"
@@ -76,10 +76,10 @@ python smb_scanner.py --target 10.0.0.5 -u administrator -p "password123"
 ### Export Results
 ```bash
 # Export to CSV and JSONL
-python smb_scanner.py --target \\\\10.0.0.5\\Share --csv results.csv --jsonl results.jsonl
+python smb_scanner.py --target \\10.0.0.5\Share --csv results.csv --jsonl results.jsonl
 
 # Generate HTML report (automatic)
-python smb_scanner.py --target \\\\10.0.0.5\\Share
+python smb_scanner.py --target \\10.0.0.5\Share
 ```
 
 ## 📖 Usage Examples
@@ -104,7 +104,7 @@ python smb_scanner.py --target 10.0.0.5 --exclude-shares "C$,ADMIN$,IPC$"
 ### 3. **Deep Content Analysis**
 ```bash
 # Increase scan depth and file size limits
-python smb_scanner.py --target \\\\10.0.0.5\\Share --max-depth 15 --deepscan-max-bytes 10485760
+python smb_scanner.py --target \\10.0.0.5\Share --max-depth 15 --deepscan-max-bytes 10485760
 ```
 
 ### 4. **Linux/Mac with Mounted CIFS**
