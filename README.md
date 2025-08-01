@@ -55,31 +55,31 @@ tqdm>=4.65.0
 ### Basic Scan
 ```bash
 # Scan all shares on a host
-python smb_scanner.py --target 10.0.0.5 --scan-contents
+python smb_scanner.py --target 10.0.0.5
 
 # Scan specific share
-python smb_scanner.py --target \\\\10.0.0.5\\Users --scan-contents
+python smb_scanner.py --target \\\\10.0.0.5\\Users
 
 # Scan specific path
-python smb_scanner.py --target \\\\10.0.0.5\\Users\\Public --scan-contents
+python smb_scanner.py --target \\\\10.0.0.5\\Users\\Public
 ```
 
 ### With Authentication
 ```bash
 # Domain authentication
-python smb_scanner.py --target 10.0.0.5 -u CORP\\alice -p "S3cret!" --scan-contents
+python smb_scanner.py --target 10.0.0.5 -u CORP\\alice -p "S3cret!"
 
 # Local authentication
-python smb_scanner.py --target 10.0.0.5 -u administrator -p "password123" --scan-contents
+python smb_scanner.py --target 10.0.0.5 -u administrator -p "password123"
 ```
 
 ### Export Results
 ```bash
 # Export to CSV and JSONL
-python smb_scanner.py --target \\\\10.0.0.5\\Share --scan-contents --csv results.csv --jsonl results.jsonl
+python smb_scanner.py --target \\\\10.0.0.5\\Share --csv results.csv --jsonl results.jsonl
 
 # Generate HTML report (automatic)
-python smb_scanner.py --target \\\\10.0.0.5\\Share --scan-contents
+python smb_scanner.py --target \\\\10.0.0.5\\Share
 ```
 
 ## 📖 Usage Examples
@@ -89,22 +89,22 @@ python smb_scanner.py --target \\\\10.0.0.5\\Share --scan-contents
 # Scan multiple hosts from file
 echo "10.0.0.5" > hosts.txt
 echo "10.0.0.10" >> hosts.txt
-python smb_scanner.py --targets-file hosts.txt --scan-contents
+python smb_scanner.py --targets-file hosts.txt
 ```
 
 ### 2. **Targeted Share Scan**
 ```bash
 # Scan only specific shares
-python smb_scanner.py --target 10.0.0.5 --include-shares "Users,Shared,Public" --scan-contents
+python smb_scanner.py --target 10.0.0.5 --include-shares "Users,Shared,Public"
 
 # Exclude admin shares
-python smb_scanner.py --target 10.0.0.5 --exclude-shares "C$,ADMIN$,IPC$" --scan-contents
+python smb_scanner.py --target 10.0.0.5 --exclude-shares "C$,ADMIN$,IPC$"
 ```
 
 ### 3. **Deep Content Analysis**
 ```bash
 # Increase scan depth and file size limits
-python smb_scanner.py --target \\\\10.0.0.5\\Share --scan-contents --max-depth 15 --deepscan-max-bytes 10485760
+python smb_scanner.py --target \\\\10.0.0.5\\Share --max-depth 15 --deepscan-max-bytes 10485760
 ```
 
 ### 4. **Linux/Mac with Mounted CIFS**
@@ -113,7 +113,7 @@ python smb_scanner.py --target \\\\10.0.0.5\\Share --scan-contents --max-depth 1
 sudo mount -t cifs //10.0.0.5/Share /mnt/smb -o username=user,password=pass
 
 # Scan mounted path
-python smb_scanner.py --mounted-root /mnt/smb --scan-contents
+python smb_scanner.py --mounted-root /mnt/smb
 ```
 
 ## 🎮 Interactive Features
@@ -255,7 +255,7 @@ Media and binary files:
 ### Debug Mode
 ```bash
 # Enable verbose output
-python smb_scanner.py --target 10.0.0.5 --scan-contents --verbose
+python smb_scanner.py --target 10.0.0.5 --verbose
 ```
 
 ## 📋 Command Line Options
@@ -283,7 +283,6 @@ python smb_scanner.py --target 10.0.0.5 --scan-contents --verbose
 
 ### Content Scanning
 ```bash
---scan-contents            # Enable content scanning
 --deepscan-max-bytes N     # Max bytes for deep scan (default: 4MB)
 --quickpeek                # Enable OOXML metadata extraction
 --max-depth N              # Maximum directory depth (default: 10)

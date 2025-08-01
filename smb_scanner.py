@@ -630,8 +630,8 @@ class SMBScanner:
             ooxml_meta = {}
             errors = []
             
-            # Scan content if requested and appropriate
-            if self.args.scan_contents and action in [Action.DEEPSCAN, Action.QUICKPEEK]:
+            # Scan content if appropriate (always enabled by default)
+            if action in [Action.DEEPSCAN, Action.QUICKPEEK]:
                 if action == Action.DEEPSCAN:
                     findings, actual_values, content_snippet = self.scan_file_content(
                         filepath, self.args.deepscan_max_bytes
@@ -1656,25 +1656,26 @@ def main():
         epilog="""
 Examples:
   # Scan all shares on a host
-  python smb_scanner.py --target 10.0.0.5 --scan-contents
-  python smb_scanner.py --target \\\\10.0.0.5 --scan-contents
+  python smb_scanner.py --target 10.0.0.5
+  python smb_scanner.py --target \\\\10.0.0.5
   
   # Scan specific share
-  python smb_scanner.py --target \\\\10.0.0.5\\Users --scan-contents
+  python smb_scanner.py --target \\\\10.0.0.5\\Users
   
   # Scan specific path within a share
-  python smb_scanner.py --target \\\\10.0.0.5\\Users\\Public --scan-contents
+  python smb_scanner.py --target \\\\10.0.0.5\\Users\\Public
   
   # With authentication
-  python smb_scanner.py --target 10.0.0.5 -u CORP\\alice -p "S3cret!" --scan-contents
+  python smb_scanner.py --target 10.0.0.5 -u CORP\\alice -p "S3cret!"
   
   # Direct UNC path (alternative)
-  python smb_scanner.py --path-unc "\\\\10.0.0.5\\Users\\Public" --scan-contents
+  python smb_scanner.py --path-unc "\\\\10.0.0.5\\Users\\Public"
   
   # Multiple targets from file
   python smb_scanner.py --targets-file hosts.txt --include-shares "Users,Shared"
   
 Note: Interactive mode is always enabled. Press 'S' during scanning to skip the current folder.
+Content scanning is always enabled by default to find sensitive data.
         """
     )
     
@@ -1701,8 +1702,7 @@ Note: Interactive mode is always enabled. Press 'S' during scanning to skip the 
     parser.add_argument('--exclude-ext', nargs='+', help='File extensions to exclude')
     parser.add_argument('--max-depth', type=int, default=10, help='Maximum directory depth to scan')
     
-    # Content scanning
-    parser.add_argument('--scan-contents', action='store_true', help='Scan file contents for sensitive patterns')
+    # Content scanning (always enabled by default)
     parser.add_argument('--deepscan-max-bytes', type=int, default=4*1024*1024, help='Maximum bytes to read for deep scan (default: 4MB)')
     parser.add_argument('--quickpeek', action='store_true', help='Enable quick peek for OOXML files')
     parser.add_argument('--quickpeek-max-bytes', type=int, default=8*1024*1024, help='Maximum bytes to read for quick peek (default: 8MB)')
