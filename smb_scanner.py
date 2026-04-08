@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SMB Sensitive Strings Scanner
-A Python-based tool that scans SMB shares for sensitive files and secrets without downloading full files.
+SMB Sensitive Strings Scanner v2 — impacket edition
+Cross-platform SMB share scanner for sensitive files and secrets.
+Supports: single IP, CIDR subnet, target file, UNC paths, mounted shares.
 """
 
 import os
@@ -11,2029 +12,1725 @@ import csv
 import argparse
 import threading
 import zipfile
+import io
+import socket
+import ipaddress
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from pathlib import Path, PureWindowsPath
-from typing import Dict, List, Tuple, Optional, Set
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
-import stat
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import time
 
-# Cross-platform keyboard input handling
+# ── Optional deps ──────────────────────────────────────────────────────────────
+
 try:
-    import msvcrt  # Windows
+    import msvcrt
+    _WINDOWS = True
     KEYBOARD_AVAILABLE = True
 except ImportError:
+    _WINDOWS = False
     try:
-        import tty
-        import termios
+        import tty, termios, select as _select
         KEYBOARD_AVAILABLE = True
     except ImportError:
         KEYBOARD_AVAILABLE = False
 
 try:
-    from colorama import init, Fore, Style
-    init(autoreset=True)
-    COLORAMA_AVAILABLE = True
+    from colorama import init as _cinit, Fore, Style
+    _cinit(autoreset=True)
+    HAS_COLOR = True
 except ImportError:
-    COLORAMA_AVAILABLE = False
-    Fore = Style = type('Dummy', (), {'__getattr__': lambda self, name: ''})()
+    HAS_COLOR = False
+    class _Dummy:
+        def __getattr__(self, _): return ''
+    Fore = Style = _Dummy()
 
 try:
     from tqdm import tqdm
-    TQDM_AVAILABLE = True
+    HAS_TQDM = True
 except ImportError:
-    TQDM_AVAILABLE = False
+    HAS_TQDM = False
+
+try:
+    from impacket.smbconnection import SMBConnection
+    HAS_IMPACKET = True
+except ImportError:
+    HAS_IMPACKET = False
+
+# SMB file access constants (fall back to raw values if impacket not present)
+try:
+    from impacket.smb3structs import (
+        FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+    )
+except ImportError:
+    FILE_READ_DATA          = 0x00000001
+    FILE_SHARE_READ         = 0x00000001
+    FILE_SHARE_WRITE        = 0x00000002
+    FILE_SHARE_DELETE       = 0x00000004
+    FILE_NON_DIRECTORY_FILE = 0x00000040
+    FILE_OPEN               = 0x00000001
+
+
+# ── Enums & dataclasses ────────────────────────────────────────────────────────
 
 class Action(Enum):
-    DEEPSCAN = "DeepScan"
+    DEEPSCAN  = "DeepScan"
     QUICKPEEK = "QuickPeek"
-    LISTONLY = "ListOnly"
-    SKIP = "Skip"
+    LISTONLY  = "ListOnly"
+    SKIP      = "Skip"
 
-class InterestingLevel(Enum):
+class Level(Enum):
     HIGH = "HIGH"
-    MED = "MED"
-    LOW = "LOW"
+    MED  = "MED"
+    LOW  = "LOW"
 
 @dataclass
 class ScanResult:
-    target: str
-    share: str
-    path: str
-    size: int
-    last_write: str
-    action: str
-    reason: str
-    interesting: str
-    findings: List[str]
-    actual_values: List[str]
+    target:          str
+    share:           str
+    path:            str
+    size:            int
+    last_write:      str
+    action:          str
+    reason:          str
+    interesting:     str
+    findings:        List[str]
+    actual_values:   List[str]
     content_snippet: str
-    ooxml_meta: Dict
-    errors: List[str]
+    ooxml_meta:      Dict
+    errors:          List[str]
+
+
+# ── Keyboard handler ───────────────────────────────────────────────────────────
 
 class KeyboardHandler:
-    """Handle keyboard input for interactive features."""
-    
     def __init__(self):
         self.skip_requested = False
-        self.running = True
-    
-    def check_for_skip(self):
-        """Check if 'S' key was pressed to skip current folder."""
+
+    def check_for_skip(self) -> bool:
         if not KEYBOARD_AVAILABLE:
             return False
-            
         try:
-            if os.name == 'nt':  # Windows
+            if _WINDOWS:
                 if msvcrt.kbhit():
-                    key = msvcrt.getch().decode('utf-8').upper()
+                    key = msvcrt.getch().decode('utf-8', errors='ignore').upper()
                     if key == 'S':
                         self.skip_requested = True
                         return True
-            else:  # Unix-like systems
-                import tty
-                import termios
-                import select
-                
-                # Check if input is available
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    # Save terminal settings
-                    old_settings = termios.tcgetattr(sys.stdin)
+            else:
+                if _select.select([sys.stdin], [], [], 0)[0]:
+                    old = termios.tcgetattr(sys.stdin)
                     try:
                         tty.setraw(sys.stdin.fileno())
-                        if sys.stdin.readable():
-                            key = sys.stdin.read(1).upper()
-                            if key == 'S':
-                                self.skip_requested = True
-                                return True
+                        key = sys.stdin.read(1).upper()
+                        if key == 'S':
+                            self.skip_requested = True
+                            return True
                     finally:
-                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        except (UnicodeDecodeError, OSError, ImportError):
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        except Exception:
             pass
         return False
-    
-    def reset_skip_flag(self):
-        """Reset the skip flag after processing."""
+
+    def reset(self):
         self.skip_requested = False
 
+
+# ── Scanner ────────────────────────────────────────────────────────────────────
+
 class SMBScanner:
+
+    # ── Init ──────────────────────────────────────────────────────────────────
     def __init__(self, args):
-        self.args = args
-        self.results = []
-        self.lock = threading.Lock()
-        self.keyboard_handler = KeyboardHandler()
-        
-        # File extension categorizations
-        self.deepscan_extensions = {
-            '.env', '.ini', '.conf', '.config', '.json', '.yaml', '.yml', '.toml', '.properties', '.xml',
-            '.ps1', '.psm1', '.bat', '.cmd', '.vbs', '.sh', '.tf', '.tfvars', '.kube', '.cfg',
-            '.txt', '.csv', '.md', '.rdp', '.rdg', '.ovpn', '.dockerfile', '.gitconfig', '.npmrc', '.pypirc',
-            '.sql', '.pgsql',
-            # Code files - add these to scan for sensitive data
-            '.php', '.py', '.aspx', '.asp', '.jsp', '.css', '.scss', '.sass',
-            '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.vb', '.rb', '.pl', '.pm', '.go', '.rs', '.swift',
-            '.kt', '.scala', '.clj', '.lua', '.r', '.m', '.mm', '.sh', '.bash', '.zsh', '.fish', '.ps1',
-            '.vbs', '.wsf', '.bat', '.cmd', '.reg', '.inf', '.ini', '.cfg', '.conf', '.config',
-            '.yml', '.yaml', '.toml', '.json', '.xml', '.csv', '.tsv', '.log', '.md', '.rst',
-            '.sql', '.pgsql', '.mysql', '.sqlite', '.db', '.mdb', '.accdb'
+        self.args      = args
+        self.results: List[ScanResult] = []
+        self.lock      = threading.Lock()
+        self.kb        = KeyboardHandler()
+        self.pbar      = None
+        self._cnt      = {'HIGH': 0, 'MED': 0, 'LOW': 0}
+        self._cnt_lock = threading.Lock()
+        self._csv_writer   = None
+        self._csv_file     = None
+        self._jsonl_file   = None
+        self._io_lock      = threading.Lock()  # separate lock for file I/O
+
+        # ── Extension sets (no duplicates, no conflicts) ──────────────────────
+        self.quickpeek_ext = {
+            '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm', '.vsdx', '.one',
         }
-        
-        self.quickpeek_extensions = {
-            '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm', '.vsdx', '.one'
-        }
-        
-        self.listonly_extensions = {
+        self.listonly_ext = {
             '.zip', '.7z', '.rar', '.tar', '.gz', '.bz2', '.xz',
             '.vhd', '.vhdx', '.vmdk', '.iso',
-            '.pst', '.ost', '.olm', '.mbox',
-            '.bak', '.mdf', '.ldf', '.sqlite', '.db',
-            '.pfx', '.p12', '.jks', '.cer', '.crt', '.der'
+            '.pst', '.ost', '.mbox',
+            '.bak', '.mdf', '.ldf',
+            '.pfx', '.p12', '.jks', '.cer', '.crt', '.der',
         }
-        
-        self.skip_extensions = {
+        self.skip_ext = {
             '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.psd', '.svg',
             '.mp3', '.wav', '.flac', '.aac', '.ogg',
             '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm',
             '.exe', '.dll', '.sys', '.msi', '.cab',
-            # JavaScript files - exclude to avoid false positives
-            '.js', '.ts', '.jsx', '.tsx',
-            # HTML files - exclude to avoid false positives
-            '.html', '.htm', '.xhtml', '.shtml',
-            # CSS files - exclude to avoid false positives
-            '.css', '.scss', '.sass', '.less',
-            # Binary files that should never be scanned
-            '.swf', '.fla', '.swc', '.flv', '.f4v', '.f4p', '.f4a', '.f4b',
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-            '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
-            '.bin', '.dat', '.obj', '.class', '.jar', '.war', '.ear',
+            '.swf', '.fla', '.pdf',
+            '.bin', '.obj', '.class', '.jar', '.war', '.ear',
             '.so', '.dylib', '.a', '.lib', '.o', '.pyc', '.pyo',
-            '.woff', '.woff2', '.ttf', '.otf', '.eot'
+            '.woff', '.woff2', '.ttf', '.otf', '.eot',
         }
-        
-        # Folder indicators (regex patterns)
-        self.folder_indicators = [
-            r'\.ssh\\',
-            r'\\secrets?\\',
-            r'\\credentials?\\',
-            r'\\configs?\\',
-            r'\\vpn\\',
-            r'\\certs?\\',
-            r'\\keys?\\',
-            r'\.aws\\',
-            r'\.azure\\',
-            r'\.gcp\\',
-            r'\.kube\\',
-            r'\.docker\\',
-            r'\.git\\',
-            r'\\keepass\\',
-            r'\\password\\',
-            r'\\backups?\\',
-            r'\\dbbackup\\',
-            r'\\rdp\\',
-            r'\\ssh\\',
-            r'\\winscp\\',
-            r'\\filezilla\\',
-            r'\\terraform\\',
-            r'\\ansible\\',
-            # Shadow folders and files
-            r'\\shadow\\',
-            r'\\shadowcopy\\',
-            r'\\vss\\',
-            r'\\volume\s*shadow\s*copy\\',
-            r'\\system\s*volume\s*information\\',
-            # Domain and Active Directory files
-            r'\\sysvol\\',
-            r'\\netlogon\\',
-            r'\\policies\\',
-            r'\\gpo\\',
-            r'\\group\s*policy\\',
-            r'\\domain\\',
-            r'\\active\s*directory\\',
-            r'\\ad\\',
-            # Security and authentication files
-            r'\\security\\',
-            r'\\auth\\',
-            r'\\authentication\\',
-            r'\\identity\\',
-            r'\\identity\s*management\\',
-            # Dump files and memory dumps
-            r'\\dumps?\\',
-            r'\\memory\s*dumps?\\',
-            r'\\crash\s*dumps?\\',
-            r'\\minidumps?\\',
-            # Configuration and policy files
-            r'\\policies\\',
-            r'\\policy\\',
-            r'\\config\\',
-            r'\\configuration\\',
-            r'\\settings\\',
-            # Backup and recovery
-            r'\\backup\\',
-            r'\\recovery\\',
-            r'\\restore\\',
-            r'\\snapshots?\\',
-            r'\\checkpoints?\\'
-        ]
-        
-        # Filename keywords
-        self.filename_keywords = [
-            r'pass|password|pwd|creds?|credential|secret|token|api[-_]?key|jwt|bearer',
-            r'client[_-]?secret|private[_-]?key|id_rsa|id_ed25519|ovpn|rdp|rdg|vpn',
-            r'certificate|keystore?|filezilla|winscp|putty|openvpn|kdbx|keepass|vault',
-            r'secret(s)?\.json|\.env(\.|$)|\.env\..*|aws|azure|gcp|kube|config',
-            r'connection.*string|db(pass|pwd)|backup|serviceAccount|secrets?-?toml',
-            r'secret.*yaml|terraform.*tfvars?|ansible.*vault',
-            # Shadow files and VSS
-            r'shadow|vss|volume\s*shadow|snapshot|checkpoint',
-            # RDP and remote access files
-            r'\.rdp$|\.rdg$|remote\s*desktop|rdp\s*config|rdp\s*settings',
-            # SSH files
-            r'id_rsa|id_ed25519|id_dsa|id_ecdsa|known_hosts|authorized_keys|ssh\s*config',
-            # Domain and Active Directory files
-            r'ntds\.dit|sam|system|security|gpo|group\s*policy|domain\s*controller',
-            # Memory dumps and crash files
-            r'lsass\.dmp|memory\.dmp|crash\.dmp|minidump|\.dmp$|\.mdmp$',
-            # Authentication and identity files
-            r'auth|authentication|identity|login|session|token|jwt|saml|oauth',
-            # Configuration and policy files
-            r'policy|policies|config|configuration|settings|preferences|profile',
-            # Backup and recovery files
-            r'backup|restore|recovery|snapshot|checkpoint|archive|dump|export'
-        ]
-        
-        # Exact filename matches
-        self.exact_filenames = {
-            'web.config', 'sitemanager.xml', 'winscp.ini', 'confCons.xml',
-            'connections.xml', 'servers.xml', 'serviceAccount.json',
-            'connectionstrings.config', 'database.yml', 'known_hosts',
-            # Shadow and VSS files
-            'ntds.dit', 'sam', 'system', 'security', 'lsass.dmp', 'memory.dmp',
-            'crash.dmp', 'minidump.dmp', 'vssadmin.exe', 'vssvc.exe',
-            # RDP files
-            'default.rdp', 'remote.rdp', 'connection.rdp', 'rdp.rdg',
-            # SSH files
-            'id_rsa', 'id_ed25519', 'id_dsa', 'id_ecdsa', 'authorized_keys',
-            'ssh_config', 'sshd_config', 'ssh_known_hosts',
-            # Domain and Active Directory files
-            'gpt.ini', 'registry.pol', 'ntuser.dat', 'usmt3.log', 'migapp.xml',
-            'miguser.xml', 'migdocs.xml', 'scanstate.exe', 'loadstate.exe',
-            # Authentication files
-            'credentials', 'passwords.txt', 'secrets.txt', 'tokens.txt',
-            'auth.json', 'auth.xml', 'login.conf', 'session.dat',
-            # Configuration files
-            'config.ini', 'settings.json', 'preferences.xml', 'profile.dat',
-            'policy.xml', 'gpo.xml', 'registry.dat', 'security.dat'
+        self.deepscan_ext = {
+            '.env', '.ini', '.conf', '.config', '.json', '.yaml', '.yml',
+            '.toml', '.properties', '.xml', '.ps1', '.psm1', '.bat', '.cmd',
+            '.vbs', '.sh', '.tf', '.tfvars', '.tfstate', '.hcl', '.cfg',
+            '.txt', '.csv', '.log', '.md', '.rdp', '.rdg', '.ovpn',
+            '.gitconfig', '.npmrc', '.pypirc', '.netrc', '.pgpass',
+            '.sql', '.pgsql', '.php', '.py', '.aspx', '.asp', '.jsp',
+            '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.vb', '.rb',
+            '.pl', '.pm', '.go', '.rs', '.swift', '.kt', '.scala', '.lua',
+            '.r', '.bash', '.zsh', '.fish', '.reg', '.inf', '.mysql',
+            '.js', '.ts', '.jsx', '.tsx', '.html', '.htm',
+            '.css', '.scss', '.sass', '.less',
+            '.sqlite', '.db', '.kube', '.htpasswd',
+        } - self.quickpeek_ext - self.listonly_ext - self.skip_ext
+
+        # ── High-value exact filenames ────────────────────────────────────────
+        self.high_filenames = {
+            'web.config', 'ntds.dit', 'sam', 'system', 'security',
+            'lsass.dmp', 'memory.dmp', 'id_rsa', 'id_ed25519', 'id_dsa',
+            'id_ecdsa', 'authorized_keys', 'ssh_config', 'sshd_config',
+            'known_hosts', 'credentials', 'passwords.txt', 'secrets.txt',
+            'tokens.txt', 'auth.json', 'serviceaccount.json', 'sitemanager.xml',
+            'winscp.ini', 'confcons.xml', 'connectionstrings.config',
+            'database.yml', '.env', '.netrc', '.pgpass',
+            'default.rdp', 'gpt.ini', 'registry.pol', 'login.conf',
+            # Git credential files
+            '.gitconfig', 'config',  # .git/config often has embedded tokens
+            '.git-credentials', 'credentials',
+            # CI/CD / infra secrets
+            'Jenkinsfile', '.travis.yml', '.circleci',
+            'terraform.tfstate', 'terraform.tfstate.backup',
+            'vault.json', 'vault.hcl',
+            # Cloud / k8s
+            'kubeconfig', '.kube', 'serviceaccount.json',
+            'gcloud_credentials.json', 'application_default_credentials.json',
+            # AI service config files
+            '.openai', 'openai.json', 'anthropic.json', '.anthropic',
+            'claude.json', 'gemini.json', '.gemini',
+            'langchain.env', 'llm.env', 'ai.env',
+            # Misc high-value
+            '.npmrc', '.pypirc', 'pip.conf',
+            'docker-compose.yml', 'docker-compose.yaml',
+            '.env.local', '.env.production', '.env.staging', '.env.development',
         }
-        
-        # Skip path patterns
-        self.skip_paths = [
-            r'\\Windows\\WinSxS\\',
-            r'\\Windows\\SoftwareDistribution\\Download\\',
-            r'\\Windows\\Temp\\',
-            r'\\Windows\\Installer\\',
-            '\\\\Program Files( \\(x86\\))?\\\\',
-            r'\\Users\\[^\\]+\\AppData\\Local\\Temp\\',
-            r'\\Users\\[^\\]+\\AppData\\Local\\Packages\\',
-            r'\\Users\\[^\\]+\\AppData\\Local\\Microsoft\\WindowsApps\\',
-            r'\\node_modules\\',
-            r'\\\$Recycle\.Bin\\',
-            r'\\System Volume Information\\',
-            # Skip js and images folders
-            r'\\js\\',
-            r'\\images\\',
-            r'\\img\\',
-            r'\\assets\\js\\',
-            r'\\assets\\images\\',
-            r'\\static\\js\\',
-            r'\\static\\images\\',
-            # Skip language folders
-            r'\\languages\\',
-            r'\\lang\\',
-            r'\\i18n\\',
-            r'\\translations\\',
-            # Skip problematic Office directories
-            r'\\Office Setup Controller\\',
-            r'\\Office16\\',
-            r'\\Office15\\',
-            r'\\Office14\\',
-            r'\\Office13\\',
-            r'\\Office12\\',
-            r'\\Office11\\',
-            r'\\Office10\\',
-            r'\\Office9\\',
-            r'\\Office8\\',
-            r'\\Office7\\',
-            r'\\Office6\\',
-            r'\\Office5\\',
-            r'\\Office4\\',
-            r'\\Office3\\',
-            r'\\Office2\\',
-            r'\\Office1\\',
-            r'\\Office0\\',
-            # Skip documentation and license files
-            r'\\LICENSE(?:\.txt|\.md)?$',
-            r'\\CHANGELOG(?:\.txt|\.md)?$',
-            r'\\CHANGES(?:\.txt|\.md)?$',
-            r'\\RELEASE_NOTES(?:\.txt|\.md)?$',
-            r'\\RELEASES(?:\.txt|\.md)?$',
-            r'\\NEWS(?:\.txt|\.md)?$',
-            r'\\README(?:\.txt|\.md)?$',
-            r'\\COPYING(?:\.txt|\.md)?$',
-            r'\\AUTHORS(?:\.txt|\.md)?$',
-            r'\\CONTRIBUTORS(?:\.txt|\.md)?$',
-            r'\\CREDITS(?:\.txt|\.md)?$',
-            r'\\HISTORY(?:\.txt|\.md)?$',
-            r'\\TODO(?:\.txt|\.md)?$',
-            r'\\VERSION(?:\.txt|\.md)?$',
-            r'\\INSTALL(?:\.txt|\.md)?$',
-            r'\\DEPENDENCIES(?:\.txt|\.md)?$',
-            r'\\NOTICE(?:\.txt|\.md)?$',
-            r'\\THANKS(?:\.txt|\.md)?$',
-            r'\\BUGS(?:\.txt|\.md)?$',
-            r'\\FAQ(?:\.txt|\.md)?$',
-            r'\\MANUAL(?:\.txt|\.md)?$',
-            r'\\DOCUMENTATION(?:\.txt|\.md)?$',
-            r'\\HELP(?:\.txt|\.md)?$',
-            r'\\GUIDE(?:\.txt|\.md)?$',
-            r'\\TUTORIAL(?:\.txt|\.md)?$',
-            r'\\EXAMPLE(?:\.txt|\.md)?$',
-            r'\\SAMPLE(?:\.txt|\.md)?$',
-            r'\\DEMO(?:\.txt|\.md)?$',
-            r'\\TEST(?:\.txt|\.md)?$',
-            r'\\BUILD(?:\.txt|\.md)?$',
-            r'\\MAKE(?:\.txt|\.md)?$',
-            r'\\CONFIGURE(?:\.txt|\.md)?$',
-            r'\\SETUP(?:\.txt|\.md)?$',
-            r'\\INSTALLATION(?:\.txt|\.md)?$',
-            r'\\CONFIGURATION(?:\.txt|\.md)?$',
-            r'\\USAGE(?:\.txt|\.md)?$',
-            r'\\API(?:\.txt|\.md)?$',
-            r'\\REFERENCE(?:\.txt|\.md)?$',
-            r'\\SPECIFICATION(?:\.txt|\.md)?$',
-            r'\\PROTOCOL(?:\.txt|\.md)?$',
-            r'\\STANDARD(?:\.txt|\.md)?$',
-            r'\\COMPLIANCE(?:\.txt|\.md)?$',
-            r'\\CERTIFICATION(?:\.txt|\.md)?$',
-            r'\\VALIDATION(?:\.txt|\.md)?$',
-            r'\\VERIFICATION(?:\.txt|\.md)?$',
-            r'\\TESTING(?:\.txt|\.md)?$',
-            r'\\QUALITY(?:\.txt|\.md)?$',
-            r'\\SECURITY(?:\.txt|\.md)?$',
-            r'\\PRIVACY(?:\.txt|\.md)?$',
-            r'\\TERMS(?:\.txt|\.md)?$',
-            r'\\CONDITIONS(?:\.txt|\.md)?$',
-            r'\\AGREEMENT(?:\.txt|\.md)?$',
-            r'\\POLICY(?:\.txt|\.md)?$',
-            r'\\DISCLAIMER(?:\.txt|\.md)?$',
-            r'\\WARRANTY(?:\.txt|\.md)?$',
-            r'\\LIABILITY(?:\.txt|\.md)?$',
-            r'\\COPYRIGHT(?:\.txt|\.md)?$',
-            r'\\TRADEMARK(?:\.txt|\.md)?$',
-            r'\\PATENT(?:\.txt|\.md)?$',
-            r'\\INTELLECTUAL_PROPERTY(?:\.txt|\.md)?$',
-            r'\\LEGAL(?:\.txt|\.md)?$',
-            r'\\REGULATORY(?:\.txt|\.md)?$',
-            r'\\COMPLIANCE(?:\.txt|\.md)?$',
-            r'\\AUDIT(?:\.txt|\.md)?$',
-            r'\\REVIEW(?:\.txt|\.md)?$',
-            r'\\ASSESSMENT(?:\.txt|\.md)?$',
-            r'\\EVALUATION(?:\.txt|\.md)?$',
-            r'\\ANALYSIS(?:\.txt|\.md)?$',
-            r'\\REPORT(?:\.txt|\.md)?$',
-            r'\\SUMMARY(?:\.txt|\.md)?$',
-            r'\\OVERVIEW(?:\.txt|\.md)?$',
-            r'\\INTRODUCTION(?:\.txt|\.md)?$',
-            r'\\CONCLUSION(?:\.txt|\.md)?$',
-            r'\\APPENDIX(?:\.txt|\.md)?$',
-            r'\\GLOSSARY(?:\.txt|\.md)?$',
-            r'\\INDEX(?:\.txt|\.md)?$',
-            r'\\BIBLIOGRAPHY(?:\.txt|\.md)?$',
-            r'\\REFERENCES(?:\.txt|\.md)?$',
-            r'\\CITATIONS(?:\.txt|\.md)?$',
-            r'\\ACKNOWLEDGMENTS(?:\.txt|\.md)?$',
-            r'\\DEDICATION(?:\.txt|\.md)?$',
-            r'\\PREFACE(?:\.txt|\.md)?$',
-            r'\\FOREWORD(?:\.txt|\.md)?$',
-            r'\\AFTERWORD(?:\.txt|\.md)?$',
-            r'\\EPILOGUE(?:\.txt|\.md)?$',
-            r'\\PROLOGUE(?:\.txt|\.md)?$',
-            r'\\CHAPTER(?:\.txt|\.md)?$',
-            r'\\SECTION(?:\.txt|\.md)?$',
-            r'\\PARAGRAPH(?:\.txt|\.md)?$',
-            r'\\SENTENCE(?:\.txt|\.md)?$',
-            r'\\WORD(?:\.txt|\.md)?$',
-            r'\\CHARACTER(?:\.txt|\.md)?$',
-            r'\\BYTE(?:\.txt|\.md)?$',
-            r'\\BIT(?:\.txt|\.md)?$',
-            r'\\NIBBLE(?:\.txt|\.md)?$',
-            r'\\OCTET(?:\.txt|\.md)?$',
-            r'\\HEX(?:\.txt|\.md)?$',
-            r'\\BINARY(?:\.txt|\.md)?$',
-            r'\\DECIMAL(?:\.txt|\.md)?$',
-            r'\\OCTAL(?:\.txt|\.md)?$',
-            r'\\HEXADECIMAL(?:\.txt|\.md)?$',
-            r'\\BIN(?:\.txt|\.md)?$',
-            r'\\DEC(?:\.txt|\.md)?$',
-            r'\\OCT(?:\.txt|\.md)?$',
-            r'\\HEX(?:\.txt|\.md)?$'
+
+        # ── Folder indicator (single compiled regex) ──────────────────────────
+        _folder_pats = [
+            r'[/\\]\.ssh[/\\]', r'[/\\]secrets?[/\\]', r'[/\\]credentials?[/\\]',
+            r'[/\\]vpn[/\\]', r'[/\\]certs?[/\\]', r'[/\\]\.aws[/\\]',
+            r'[/\\]\.azure[/\\]', r'[/\\]\.gcp[/\\]', r'[/\\]\.kube[/\\]',
+            r'[/\\]\.docker[/\\]', r'[/\\]keepass[/\\]', r'[/\\]passwords?[/\\]',
+            r'[/\\]backups?[/\\]', r'[/\\]rdp[/\\]', r'[/\\]ssh[/\\]',
+            r'[/\\]winscp[/\\]', r'[/\\]filezilla[/\\]', r'[/\\]terraform[/\\]',
+            r'[/\\]ansible[/\\]', r'[/\\]vault[/\\]', r'[/\\]shadow[/\\]',
+            r'[/\\]vss[/\\]', r'[/\\]sysvol[/\\]', r'[/\\]netlogon[/\\]',
+            r'[/\\]gpo[/\\]', r'[/\\]dumps?[/\\]', r'[/\\]security[/\\]',
+            r'[/\\]auth[/\\]', r'[/\\]configs?[/\\]', r'[/\\]keys?[/\\]',
+            r'[/\\]\.git[/\\]',  # .git dir contains config with potential embedded tokens
+            r'[/\\]\.gitconfig[/\\]', r'[/\\]repos?[/\\]',
         ]
-        
-        # Content regex patterns
-        self.content_patterns = {
+        self.folder_re = re.compile('|'.join(_folder_pats), re.IGNORECASE)
+
+        # ── Filename keyword (single compiled regex) ──────────────────────────
+        self.filename_re = re.compile(
+            r'pass(?:word)?|pwd|creds?|credential|secret|token|api[-_]?key|jwt|bearer|'
+            r'private[-_]?key|id_rsa|id_ed25519|ovpn|\.rdp|vpn|certificate|'
+            r'keepass|kdbx|vault|\.aws|\.azure|kube|'
+            r'connection.*string|connectionstring|backup|serviceaccount|shadow|lsass|ntds|'
+            r'auth(?:ent)?|login|oauth|saml|'
+            r'\.gitconfig|git.?credential|git.?config|\.git-credentials|'
+            r'openai|anthropic|claude|gemini|mistral|groq|cohere|replicate|'
+            r'langchain|langsmith|wandb|pinecone|weaviate|qdrant|chroma|'
+            r'elevenlabs|assemblyai|stability|runway|together|fireworks|perplexity',
+            re.IGNORECASE,
+        )
+
+        # ── Skip paths (single compiled regex for speed) ──────────────────────
+        _skip_pats = [
+            r'[/\\]Windows[/\\]WinSxS[/\\]',
+            r'[/\\]Windows[/\\]SoftwareDistribution[/\\]',
+            r'[/\\]Windows[/\\]Temp[/\\]',
+            r'[/\\]Windows[/\\]Installer[/\\]',
+            r'[/\\]Program Files(?:\s*\(x86\))?[/\\]',
+            r'[/\\]AppData[/\\]Local[/\\]Temp[/\\]',
+            r'[/\\]AppData[/\\]Local[/\\]Packages[/\\]',
+            r'[/\\]AppData[/\\]Local[/\\]Microsoft[/\\]WindowsApps[/\\]',
+            r'[/\\]node_modules[/\\]',
+            r'[/\\]\$Recycle\.Bin[/\\]',
+            r'[/\\]System Volume Information[/\\]',
+            r'[/\\]\.git[/\\]objects[/\\]',
+            r'[/\\]__pycache__[/\\]',
+            r'[/\\]\.npm[/\\]',
+            r'[/\\]bower_components[/\\]',
+            r'[/\\]vendor[/\\]bundle[/\\]',
+            r'[/\\]Office(?:1[0-6]|[5-9])[/\\]',
+            r'[/\\]MSOCache[/\\]',
+        ]
+        self.skip_path_re = re.compile('|'.join(_skip_pats), re.IGNORECASE)
+
+        # ── Content patterns ──────────────────────────────────────────────────
+        _content_patterns: Dict[str, List[str]] = {
             'Cloud': [
-                r'AKIA[0-9A-Z]{16}',
-                r'aws_access_key_id\s*=\s*[A-Z0-9]{16,20}',
-                r'aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{30,50}',
-                r'(?i)azure[_-]?client[_-]?secret[^A-Za-z0-9]{1,10}[A-Za-z0-9_\-]{20,}',
-                r'(?i)google(?:_|-)?api(?:_|-)?key[^A-Za-z0-9]{1,10}[A-Za-z0-9_\-]{20,}'
+                # AWS
+                r'(AKIA[0-9A-Z]{16})',
+                r'(ASIA[0-9A-Z]{16})',
+                r'aws_access_key_id\s*[=:]\s*["\']?([A-Z0-9]{16,20})',
+                r'aws_secret_access_key\s*[=:]\s*["\']?([A-Za-z0-9/+=]{30,50})',
+                # Azure
+                r'(?i)azure[_-]?client[_-]?secret\s*[=:]\s*["\']?([A-Za-z0-9~._\-]{30,})',
+                r'(?i)azure[_-]?(?:tenant|subscription)[_-]?id\s*[=:]\s*["\']?([0-9a-f\-]{36})',
+                # GCP
+                r'(AIza[A-Za-z0-9_\-]{35})',
+                r'(?s)("type"\s*:\s*"service_account"[^}]{0,500}"private_key_id"\s*:\s*"([^"]{20,})")',
+                # DigitalOcean
+                r'(do(?:p|o|a)_v1_[a-f0-9]{64})',
+                # Heroku (UUID with context keyword)
+                r'(?i)heroku[^"\s]*\s*[=:]\s*["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+                # Cloudflare
+                r'(?i)cloudflare[^"\s]*\s*[=:]\s*["\']?([A-Za-z0-9_\-]{37,40})',
+            ],
+            'Tokens': [
+                # GitHub
+                r'(ghp_[A-Za-z0-9]{36})',
+                r'(gho_[A-Za-z0-9]{36})',
+                r'(ghs_[A-Za-z0-9]{36})',
+                r'(ghu_[A-Za-z0-9]{36})',
+                r'(github_pat_[A-Za-z0-9_]{82})',
+                # GitLab
+                r'(glpat-[A-Za-z0-9_\-]{20})',
+                # Slack
+                r'(xox[baprs]-[0-9A-Za-z\-]{10,})',
+                # Stripe
+                r'([rs]k_live_[0-9a-zA-Z]{20,247})',
+                r'(pk_live_[0-9a-zA-Z]{24,})',
+                # Twilio
+                r'(AC[0-9a-f]{32})',            # Account SID
+                r'(SK[0-9a-fA-F]{32})',         # Auth token / API key
+                # HashiCorp Vault
+                r'(hvs\.[A-Za-z0-9_\-]{90,})',
+                r'(hvb\.[A-Za-z0-9_\-]{90,})',  # batch token
+                r'(hvr\.[A-Za-z0-9_\-]{90,})',  # recovery token
+                # npm
+                r'(npm_[A-Za-z0-9]{36})',
+                # JWT
+                r'(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})',
+                # OpenAI
+                r'(sk-[A-Za-z0-9]{20,}T3BlbkFJ[A-Za-z0-9_\-]{20,})',
+                r'(sk-proj-[A-Za-z0-9_\-]{50,})',
+                r'(sk-svcacct-[A-Za-z0-9_\-]{50,})',
+                # Hugging Face
+                r'(hf_[a-zA-Z0-9]{34,})',
+                r'(api_org_[a-zA-Z0-9]{34,})',
+                # SendGrid
+                r'(SG\.[A-Za-z0-9_\-]{20,24}\.[A-Za-z0-9_\-]{39,50})',
+                # Mailgun
+                r'(key-[a-z0-9]{32})',
+                # Mailchimp
+                r'([0-9a-f]{32}-us\d{1,2})',
+                # Discord
+                r'(https?://discord(?:app)?\.com/api/webhooks/\d{17,19}/[A-Za-z0-9_\-]{60,})',
+                r'(?i)discord[_-]?(?:bot[_-]?)?token\s*[=:]\s*["\']?([A-Za-z0-9_\-\.]{59,})',
+                # Telegram
+                r'(\d{8,10}:[A-Za-z0-9_\-]{35})',
+                # Shopify
+                r'(shp(?:pa|at|ca|ss)_[0-9A-Fa-f]{32})',
+                # Square
+                r'(EAAA[a-zA-Z0-9\-\+\=]{60})',
+                r'(sq0atp-[A-Za-z0-9_\-]{22})',
+                r'(sq0csp-[A-Za-z0-9_\-]{43})',
+                # New Relic
+                r'(NRAK-[A-Z0-9]{27})',
+                r'(NRAA-[A-Za-z0-9._\-]{71})',
+                r'(NRII-[A-Za-z0-9\-]{32})',
+                # Doppler
+                r'(dp\.(?:ct|pt|st(?:\.[a-z0-9\-_]{2,35})?|sa|scim|audit)\.[A-Za-z0-9]{36,44})',
+                # Atlassian / Jira PAT
+                r'(ATATT[A-Za-z0-9_=]{184,})',
+                # SonarQube
+                r'(squ_[a-f0-9]{40})',
+                r'(sqp_[a-f0-9]{40})',  # SonarCloud user token
+                # Grafana
+                r'(glc_eyJ[A-Za-z0-9+\/=]{60,160})',
+                r'(glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8})',  # Grafana service account token
+                # PyPI
+                r'(pypi-AgEIcHlwaS5vcmcCJ[A-Za-z0-9\-_]{150,157})',
+                # RubyGems
+                r'(rubygems_[A-Za-z0-9]{48})',
+                # JFrog Artifactory
+                r'(AKCp[a-zA-Z0-9]{69})',
+                # Generic API key with context
+                r'(?i)bearer\s+([A-Za-z0-9_\-\.=+/]{20,})',
+                r'(?i)api[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})',
             ],
             'Secrets': [
-                # More specific credential patterns to avoid false positives
-                r'(?i)(?:password|pass|pwd|secret|token|bearer)\s*[:=]\s*["\']?[A-Za-z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?]{8,}["\']?(?:\s*[,;]|\s*$|\s*\))',
-                # JWT tokens
-                r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}',
-                # Private keys
-                r'-----BEGIN (?:RSA|EC|DSA|OPENSSH|PRIVATE) KEY-----',
-                # API keys with specific patterns
-                r'(?i)(?:api[_-]?key|access[_-]?key|secret[_-]?key)\s*[:=]\s*["\']?[A-Za-z0-9]{20,}["\']?',
-                # Database passwords in connection strings
-                r'(?i)(?:password|pwd)\s*[:=]\s*["\']?[A-Za-z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?]{6,}["\']?(?:\s*[,;]|\s*$|\s*\))',
-                # Environment variable style credentials
-                r'(?i)(?:DB_PASSWORD|DB_PASS|DB_PWD|API_KEY|SECRET_KEY|ACCESS_KEY)\s*[:=]\s*["\']?[A-Za-z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?]{8,}["\']?',
-                # Hardcoded credentials in code (avoiding form fields and variables)
-                r'(?i)(?:password|pass|pwd|secret|token)\s*[:=]\s*["\']?[A-Za-z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?]{8,}["\']?(?:\s*[,;]|\s*$|\s*\))',
-                # Exclude common false positives (PHP variables, form fields, etc.)
-                r'(?i)(?:password|pass|pwd|secret|token)\s*[:=]\s*["\']?(?:\$[a-zA-Z_][a-zA-Z0-9_]*|type|text|input|field|required|min|max|placeholder|id|name|class|style|arg_[a-zA-Z_][a-zA-Z0-9_]*)["\']?'
+                # Private keys (PEM)
+                r'(-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----)',
+                r'(-----BEGIN PGP PRIVATE KEY BLOCK-----)',
+                # Password patterns
+                r'(?i)(?:password|passwd|pass|pwd)\s*[=:]\s*["\']([^"\']{8,})["\']',
+                r'(?i)(?:password|passwd|pass|pwd)\s*=\s*([^;"\s\'<>]{6,})',
+                # Secret/token literals
+                r'(?i)(?:secret|token)\s*[=:]\s*["\']([^"\']{8,})["\']',
+                # Env-var style uppercase assignments
+                r'(?i)((?:DB_PASSWORD|DB_PASS|API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|CLIENT_SECRET|APP_SECRET|MASTER_KEY|ENCRYPTION_KEY)\s*=\s*[^\s\'"]{8,})',
+                # PowerShell ConvertTo-SecureString / credential patterns
+                r'(?i)ConvertTo-SecureString\s+["\']([^"\']{6,})["\']',
+                r'(?i)New-Object\s+System\.Management\.Automation\.PSCredential.{0,80}["\']([^"\']{6,})["\']',
+                # net use / Windows CLI credentials
+                r'(?i)net\s+use\s+[^\s]+\s+([^\s"\']{6,})\s+/user',
+                # LDAP bind password
+                r'(?i)(?:ldap|ad)[_-]?(?:bind[_-]?)?(?:password|pass|pwd)\s*[=:]\s*["\']?([^"\';\s]{6,})',
             ],
             'DB_Connection': [
-                r'(?i)(server|host|data\s*source)=[^;]{3,};(?:[^;]+;){0,3}user\s*id=[^;]+;[^;]*password=[^;]+;',
-                r'(?i)(mongodb|postgres|mysql|mariadb|redis|mssql):\/\/[^\'"\s]{10,}'
+                # URI-style connection strings
+                r'(?i)((?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb|redis|rediss|mssql|sqlserver|oracle|cassandra|couchdb|elasticsearch|opensearch|neo4j(?:\+s)?|amqp(?:s)?):\/\/[^\'"\s]{10,})',
+                # ADO.NET / ODBC key=value chains
+                r'(?i)((?:server|host|data\s*source)\s*=[^;]{3,};[^;]*password\s*=[^;]+)',
+                r'(?i)(Data Source=[^;]+;[^;]*Password\s*=[^;]+)',
+                # XML attribute style (web.config, app.config)
+                r'(?i)connectionstrings?\s*=\s*["\']([^"\']{15,})["\']',
+                # JSON/YAML key style
+                r'(?i)["\']?connectionstrings?["\']?\s*:\s*["\']([^"\']{15,})["\']',
+                # Elasticsearch cloud ID
+                r'(?i)(?:cloud[_-]?id|elastic[_-]?cloud)\s*[=:]\s*["\']?([A-Za-z0-9_:\-]{20,})',
+            ],
+            'AI_Services': [
+                # Anthropic Claude
+                r'(sk-ant-(?:api03|admin01)-[A-Za-z0-9_\-]{80,})',
+                # OpenAI  (already in Tokens but also here for category tagging)
+                r'(sk-(?:proj|svcacct|service)-[A-Za-z0-9_\-]{50,})',
+                # Replicate
+                r'(r8_[A-Za-z0-9]{36,})',
+                # Groq
+                r'(gsk_[A-Za-z0-9]{48,})',
+                # Perplexity
+                r'(pplx-[a-f0-9]{40,})',
+                # xAI (Grok)
+                r'(xai-[A-Za-z0-9_\-]{60,})',
+                # OpenRouter
+                r'(sk-or-(?:v1-)?[A-Za-z0-9_\-]{40,})',
+                # LangSmith / LangChain
+                r'(ls(?:v2)?__[a-zA-Z0-9_\-]{32,})',
+                # Fireworks AI
+                r'(fw_[A-Za-z0-9]{32,})',
+                # DeepSeek (uses sk- prefix, needs context)
+                r'(?i)deepseek[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?(sk-[A-Za-z0-9]{32,})',
+                # Cohere (context-based, no unique prefix)
+                r'(?i)cohere[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([A-Za-z0-9]{40,})',
+                # Mistral AI (context-based)
+                r'(?i)mistral[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([A-Za-z0-9]{32,})',
+                # Together AI
+                r'(?i)together(?:ai?)?[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([a-f0-9]{64})',
+                # ElevenLabs
+                r'(?i)elevenlabs?[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([a-f0-9]{32})',
+                # AssemblyAI
+                r'(?i)assemblyai?[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([a-f0-9]{32})',
+                # Stability AI
+                r'(?i)stability[_-]?(?:ai?[_-]?)?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([A-Za-z0-9\-_]{40,})',
+                # Weights & Biases
+                r'(?i)(?:wandb|weights[_-]?biases?)[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([a-f0-9]{40})',
+                # Pinecone
+                r'(?i)pinecone[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([a-f0-9\-]{32,})',
+                # AI21 Labs
+                r'(?i)ai21[_-]?(?:api[_-]?)?(?:key|token)\s*[=:]\s*["\']?([A-Za-z0-9]{32,})',
+                # RunwayML
+                r'(?i)runway(?:ml)?[_-]?(?:api[_-]?)?(?:key|token|secret)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{32,})',
+                # Voyage AI (embeddings)
+                r'(pa-[A-Za-z0-9_\-]{40,})',
+                # Cerebras
+                r'(csk-[A-Za-z0-9_\-]{40,})',
+            ],
+            'Git_Credentials': [
+                # Embedded creds in remote URL: https://user:token@github.com
+                r'(?i)(https?://[^:@\s"\']{3,}:[^@\s"\']{3,}@(?:github|gitlab|bitbucket|gitea|dev\.azure)[^\s"\']{5,})',
+                # git config url = https://token@host
+                r'(?i)url\s*=\s*(https?://[A-Za-z0-9_\-\.]+@[^\s"\']{8,})',
+                # .git-credentials or git credential store format
+                r'(?i)(https?://[^:@\s]+:[^@\s]{6,}@[a-z0-9\.\-]+)',
+                # remote = https://...@...
+                r'(?i)(?:remote|origin|upstream)\s*=\s*(https?://[^\s"\']*@[^\s"\']+)',
             ],
             'Network_Addresses': [
-                # Internal IPs (private ranges)
-                r'\b10\.(\d{1,3}\.){2}\d{1,3}\b',
-                r'\b192\.168\.(\d{1,3})\.\d{1,3}\b',
-                r'\b172\.(1[6-9]|2\d|3[0-1])\.(\d{1,3})\.\d{1,3}\b',
-                # External IPs (public IP ranges) - only if they look like real IPs
-                r'\b(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\b',
-                # High-probability hostnames (not random domains)
-                r'(?i)(?:server|host|endpoint|api|jenkins|gitlab|github|bitbucket|jira|confluence|nexus|artifactory|sonar|prometheus|grafana|kibana|elasticsearch|redis|mysql|postgres|mongo|oracle|sqlserver)\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}',
-                # CI/CD and cloud asset URLs
-                r'(?i)(?:https?://)(?:jenkins|gitlab|github|bitbucket|jira|confluence|nexus|artifactory|sonar|prometheus|grafana|kibana|elasticsearch|aws|azure|gcp|cloudflare|heroku|vercel|netlify)\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}(?::[0-9]+)?(?:/[^\s]*)?',
-                # Database connection strings with hostnames
-                r'(?i)(?:mysql|postgres|mongo|redis|oracle|sqlserver)://[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.[a-zA-Z]{2,}(?::[0-9]+)?(?:/[^\s]*)?'
+                r'(\b10\.(?:\d{1,3}\.){2}\d{1,3}\b)',
+                r'(\b192\.168\.\d{1,3}\.\d{1,3}\b)',
+                r'(\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b)',
+                r'(?i)((?:server|host|endpoint|jenkins|gitlab|jira|nexus|artifactory|sonar|grafana|kibana|elasticsearch|redis|mysql|postgres|mongo)\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?(?:\.[a-z]{2,})+)',
             ],
             'Emails': [
-                # Standard email addresses
-                r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-                # Email addresses in configuration contexts
-                r'(?i)(email|mail|contact|admin|user|username)\s*[:=]\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}',
-                # Email addresses in quotes
-                r'["\'][A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}["\']',
-                # Email addresses in variables
-                r'\$[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*["\'][A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}["\']'
+                r'(\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b)',
             ],
             'Domain_Users': [
-                # Only detect actual domain\username patterns in credential contexts
-                r'(?i)(?:username|user|login|account)\s*[:=]\s*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)',  # username: domain\user
-                r'(?i)(?:password|pass|pwd)\s*[:=]\s*[^,\s\'"]{6,}\s*(?:domain|user)\s*[:=]\s*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)',  # password with domain
-                r'(?i)(?:auth|authentication)\s*[:=]\s*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)',  # auth: domain\user
-                r'(?i)(?:service\s*account|svc\s*account)\s*[:=]\s*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)',  # service account: domain\user
-                # Connection strings with domain users
-                r'(?i)(?:server|host)\s*[:=]\s*[^;]+;.*user\s*[:=]\s*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)',  # server=...;user=domain\user
-                # RDP connection strings
-                r'(?i)(?:rdp|remote|desktop)\s*[:=]\s*.*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)',  # rdp: ...domain\user
-                # Windows authentication patterns
-                r'(?i)(?:windows\s*auth|ntlm|kerberos)\s*[:=]\s*[A-Za-z0-9_-]+\\([A-Za-z0-9_-]+)'  # windows auth: domain\user
+                r'(?i)(?:username|user|login|account)\s*[=:]\s*([A-Za-z0-9_\-]+\\[A-Za-z0-9_\-]+)',
+                r'(?i)(?:service\s*account|svc)\s*[=:]\s*([A-Za-z0-9_\-]+\\[A-Za-z0-9_\-]+)',
+                # UPN format: user@domain (filtered in post: must look like internal domain)
+                r'(?i)(?:username|runas|run[_-]?as|service[_-]?account)\s*[=:]\s*["\']?([A-Za-z0-9_\-\.]+@[A-Za-z0-9_\-]+\.[A-Za-z]{2,})["\']?',
             ],
             'Hebrew': [
-                r'(סיסמה|סיסמא|שם\s*משתמש|טוקן|אסימון)\s*[:=]\s*[^,\s\'"]{4,}'
+                r'((?:סיסמה|סיסמא|שם\s*משתמש|טוקן|אסימון)\s*[=:]\s*[^\s,\'"]{4,})',
             ],
             'Shadow_Files': [
-                # Shadow copy references
-                r'(?i)shadow\s*copy|volume\s*shadow|vss|shadowcopy',
-                # VSS commands and references
-                r'(?i)vssadmin|vssvc|shadow\s*storage|shadow\s*volume',
-                # NTDS.dit references
-                r'(?i)ntds\.dit|sam|system|security\s*database',
-                # LSASS dump references
-                r'(?i)lsass\.dmp|memory\s*dump|crash\s*dump|minidump',
-                # Domain controller references
-                r'(?i)domain\s*controller|dc\s*backup|ad\s*backup',
-                # GPO and policy references
-                r'(?i)group\s*policy|gpo|policy\s*backup|registry\.pol',
-                # Backup and recovery references
-                r'(?i)backup\s*shadow|restore\s*shadow|vss\s*backup'
-            ]
+                r'(?i)((?:shadow\s*copy|volume\s*shadow|vssadmin|ntds\.dit|lsass\.dmp))',
+                r'(?i)((?:domain\s*controller|dc\s*backup|ad\s*backup|registry\.pol))',
+            ],
         }
-        
-        # Compile regex patterns
-        self.folder_regex = [re.compile(pattern, re.IGNORECASE) for pattern in self.folder_indicators]
-        self.filename_regex = [re.compile(pattern, re.IGNORECASE) for pattern in self.filename_keywords]
-        self.skip_regex = [re.compile(pattern, re.IGNORECASE) for pattern in self.skip_paths]
-        self.content_regex = {}
-        for category, patterns in self.content_patterns.items():
-            self.content_regex[category] = [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+
+        self.content_re: Dict[str, List[re.Pattern]] = {
+            cat: [re.compile(p) for p in pats]
+            for cat, pats in _content_patterns.items()
+        }
+
+        self.high_cats = {'Cloud', 'Tokens', 'Secrets', 'OfficeMeta_High', 'Git_Credentials', 'DB_Connection', 'AI_Services'}
+        self.med_cats  = {'Network_Addresses', 'Domain_Users', 'OfficeMeta'}
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def format_mtime(mtime) -> str:
+        """Convert SMB FILETIME int or local datetime string to 'YYYY-MM-DD HH:MM'."""
+        try:
+            if isinstance(mtime, int) or (isinstance(mtime, str) and mtime.isdigit()):
+                # Windows FILETIME: 100-ns ticks since 1601-01-01
+                ft = int(mtime)
+                if ft == 0:
+                    return ''
+                from datetime import timedelta
+                dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+                return dt.strftime('%Y-%m-%d %H:%M')
+            elif isinstance(mtime, str):
+                # Already a string (local scan isoformat) — reformat
+                dt = datetime.fromisoformat(mtime[:19])
+                return dt.strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            pass
+        return str(mtime)[:16]
+
+    def format_size(self, b: int) -> str:
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if b < 1024:
+                return f'{b:.0f}{unit}' if unit == 'B' else f'{b:.1f}{unit}'
+            b /= 1024.0
+        return f'{b:.1f}TB'
 
     def should_skip_path(self, path: str) -> bool:
-        """Check if path should be skipped based on skip patterns."""
-        if self.args.skip_path_defaults:
+        if getattr(self.args, 'no_skip_defaults', False):
             return False
-        
-        path_lower = path.lower()
-        for pattern in self.skip_regex:
-            if pattern.search(path_lower):
-                return True
-        return False
+        return bool(self.skip_path_re.search(path))
 
-    def get_file_action(self, filepath: str, filename: str) -> Tuple[Action, str]:
-        """Determine the action to take for a file based on its extension and name."""
+    def _get_action(self, filename: str) -> Tuple[Action, str]:
+        fn_lower = filename.lower()
+        if fn_lower in self.high_filenames:
+            return Action.DEEPSCAN, 'exact_filename'
         ext = Path(filename).suffix.lower()
-        
-        # Check exact filename matches
-        if filename in self.exact_filenames:
-            return Action.DEEPSCAN, "exact_filename_match"
-        
-        # Check extension categories
-        if ext in self.deepscan_extensions:
-            return Action.DEEPSCAN, "deepscan_extension"
-        elif ext in self.quickpeek_extensions:
-            return Action.QUICKPEEK, "quickpeek_extension"
-        elif ext in self.listonly_extensions:
-            return Action.LISTONLY, "listonly_extension"
-        elif ext in self.skip_extensions:
-            return Action.SKIP, "skip_extension"
-        
-        # Check filename keywords
-        for pattern in self.filename_regex:
-            if pattern.search(filename):
-                return Action.DEEPSCAN, "filename_keyword_match"
-        
-        return Action.SKIP, "no_indicators"
+        if ext in self.deepscan_ext:   return Action.DEEPSCAN,  'deepscan_ext'
+        if ext in self.quickpeek_ext:  return Action.QUICKPEEK, 'quickpeek_ext'
+        if ext in self.listonly_ext:   return Action.LISTONLY,  'listonly_ext'
+        if ext in self.skip_ext:       return Action.SKIP,      'skip_ext'
+        if self.filename_re.search(filename): return Action.DEEPSCAN, 'filename_kw'
+        return Action.SKIP, 'no_indicator'
 
-    def get_interesting_level(self, filepath: str, filename: str, content_matches: List[str]) -> Tuple[InterestingLevel, str]:
-        """Determine the interesting level based on path, filename, and content matches."""
+    def _get_level(self, path: str, filename: str, cats: List[str]) -> Tuple[Level, str]:
         reasons = []
-        
-        # Check folder indicators
-        for pattern in self.folder_regex:
-            if pattern.search(filepath):
-                reasons.append("folder_indicator")
-                break
-        
-        # Check filename keywords
-        for pattern in self.filename_regex:
-            if pattern.search(filename):
-                reasons.append("filename_match")
-                break
-        
-        # Check exact filename matches
-        if filename in self.exact_filenames:
-            reasons.append("exact_filename")
-        
-        # NEW PRIORITY LOGIC:
-        # HIGH Priority: CI/CD patterns, Passwords/Tokens, and specific sensitive files
-        high_priority_categories = ['Cloud', 'Secrets']
-        high_priority_files = {
-            'web.config', 'ntds.dit', 'sam', 'system', 'security', 'lsass.dmp', 
-            'memory.dmp', 'crash.dmp', 'minidump.dmp', 'id_rsa', 'id_ed25519', 
-            'id_dsa', 'id_ecdsa', 'authorized_keys', 'ssh_config', 'sshd_config',
-            'ssh_known_hosts', 'known_hosts', 'credentials', 'passwords.txt', 
-            'secrets.txt', 'tokens.txt', 'auth.json', 'auth.xml', 'login.conf',
-            'session.dat', 'config.ini', 'settings.json', 'preferences.xml',
-            'profile.dat', 'policy.xml', 'gpo.xml', 'registry.dat', 'security.dat'
-        }
-        
-        # Check for HIGH priority content matches
-        if content_matches:
-            for category in content_matches:
-                if category in high_priority_categories:
-                    reasons.append(f"high_priority_content_{category}")
-                    return InterestingLevel.HIGH, ",".join(reasons)
-        
-        # Check for HIGH priority files
-        if filename in high_priority_files:
-            reasons.append("high_priority_file")
-            return InterestingLevel.HIGH, ",".join(reasons)
-        
-        # MEDIUM Priority: IP addresses and interesting domains
-        medium_priority_categories = ['Network_Addresses']
-        
-        # Check for MEDIUM priority content matches
-        if content_matches:
-            for category in content_matches:
-                if category in medium_priority_categories:
-                    reasons.append(f"medium_priority_content_{category}")
-                    return InterestingLevel.MED, ",".join(reasons)
-        
-        # LOW Priority: Everything else (Shadow_Files, Emails, Domain_Users, Hebrew, etc.)
-        if content_matches:
-            reasons.append("low_priority_content")
-            return InterestingLevel.LOW, ",".join(reasons)
-        
-        # Multiple indicators suggest MED level (if no content matches)
-        if len(reasons) > 1:
-            return InterestingLevel.MED, ",".join(reasons)
-        elif len(reasons) == 1:
-            return InterestingLevel.LOW, ",".join(reasons)
-        
-        return InterestingLevel.LOW, "weak_indicators"
+        if self.folder_re.search(path):        reasons.append('folder')
+        if self.filename_re.search(filename):  reasons.append('filename')
+        if filename.lower() in self.high_filenames: reasons.append('exact_filename')
 
-    def scan_file_content(self, filepath: str, max_bytes: int = None) -> Tuple[List[str], List[str], str]:
-        """Scan file content for sensitive patterns."""
-        if max_bytes is None:
-            max_bytes = self.args.deepscan_max_bytes
-        
-        findings = []
-        actual_values = []
-        content_snippet = ""
-        
-        try:
-            # Check file size first to avoid processing extremely large files
-            file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:  # 50MB limit
-                return [], [], f"File too large ({self.format_size(file_size)}) - skipping content scan"
-            
-            with open(filepath, 'rb') as f:
-                # Read first max_bytes with timeout protection
+        for cat in cats:
+            if cat in self.high_cats:
+                return Level.HIGH, ','.join(reasons + [f'content:{cat}'])
+        if filename.lower() in self.high_filenames:
+            return Level.HIGH, ','.join(reasons)
+        for cat in cats:
+            if cat in self.med_cats:
+                return Level.MED, ','.join(reasons + [f'content:{cat}'])
+        if cats:
+            return Level.LOW, ','.join(reasons + ['content:low'])
+        if len(reasons) > 1: return Level.MED, ','.join(reasons)
+        if reasons:          return Level.LOW, ','.join(reasons)
+        return Level.LOW, 'weak'
+
+    # ── Content analysis ──────────────────────────────────────────────────────
+
+    def analyse_bytes(self, data: bytes, max_bytes: int) -> Tuple[List[str], List[str], str]:
+        """Return (findings, actual_values, snippet_line_with_match)."""
+        data = data[:max_bytes]
+        if not data:
+            return [], [], ''
+
+        # Binary detection
+        sample       = data[:4096]
+        null_ratio   = sample.count(b'\x00') / max(len(sample), 1)
+        nonpr_ratio  = sum(1 for b in sample if b < 32 and b not in (9, 10, 13)) / max(len(sample), 1)
+        if null_ratio > 0.1 or nonpr_ratio > 0.3:
+            return [], [], ''
+
+        text = data.decode('utf-8', errors='replace')
+
+        findings: List[str] = []
+        values:   List[str] = []
+        snippet = ''
+
+        for cat, patterns in self.content_re.items():
+            for pat in patterns:
                 try:
-                    import signal
-                    
-                    def timeout_handler(signum, frame):
-                        raise TimeoutError("File reading timeout")
-                    
-                    # Set timeout for file reading (30 seconds)
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(30)
-                    
-                    try:
-                        content = f.read(max_bytes)
-                    finally:
-                        signal.alarm(0)  # Cancel the alarm
-                        
-                except (TimeoutError, AttributeError):
-                    # Timeout or signal not available (Windows)
-                    content = f.read(max_bytes)
-                
-                # Check if file is binary by looking for null bytes or high ratio of non-printable characters
-                null_count = content.count(b'\x00')
-                non_printable_count = sum(1 for byte in content if byte < 32 and byte != 9 and byte != 10 and byte != 13)
-                
-                # If more than 10% null bytes or 30% non-printable characters, it's likely binary
-                if null_count > len(content) * 0.1 or non_printable_count > len(content) * 0.3:
-                    return [], [], "Binary file detected - skipping content scan"
-                
-                # Try to decode as text
-                try:
-                    text_content = content.decode('utf-8', errors='ignore')
-                except UnicodeDecodeError:
-                    text_content = content.decode('latin-1', errors='ignore')
-                
-                # Additional check: if the decoded text contains mostly non-printable characters, skip
-                printable_chars = sum(1 for char in text_content if char.isprintable() or char in '\n\r\t')
-                if printable_chars < len(text_content) * 0.7:  # Less than 70% printable characters
-                    return [], [], "Binary file detected - skipping content scan"
-                
-                # Scan for patterns with timeout protection
-                for category, patterns in self.content_regex.items():
-                    for pattern in patterns:
-                        try:
-                            # Set timeout for pattern matching (5 seconds per pattern)
-                            if hasattr(signal, 'SIGALRM'):
-                                signal.signal(signal.SIGALRM, timeout_handler)
-                                signal.alarm(5)
-                            
-                            try:
-                                matches = pattern.findall(text_content)
-                                if matches:
-                                    findings.append(f"{category}:{pattern.pattern}")
-                                    # Store actual matched values, not just patterns
-                                    for match in matches:
-                                        if isinstance(match, tuple):
-                                            # Handle groups in regex
-                                            actual_value = f"{category}:{match[0] if match[0] else ' '.join(match)}"
-                                        else:
-                                            actual_value = f"{category}:{match}"
-                                        
-                                        # Filter out false positives for Domain_Users
-                                        if category == 'Domain_Users':
-                                            # Skip if it looks like code (contains common code patterns)
-                                            if any(code_pattern in actual_value.lower() for code_pattern in [
-                                                'document.', 'window.', 'function', 'var ', 'let ', 'const ',
-                                                'if ', 'for ', 'while ', 'return ', 'class ', 'import ',
-                                                'require', 'include', 'echo ', 'print ', 'console.',
-                                                'http', 'https', '.com', '.org', '.git', '.txt', '.php',
-                                                '<?php', '<!--', '//', '/*', '*/', 'function(', '()',
-                                                'length', 'push', 'pop', 'replace', 'split', 'join',
-                                                'addEventListener', 'onclick', 'onload', 'onchange'
-                                            ]):
-                                                continue
-                                        
-                                        # Only add if not already present (deduplicate)
-                                        if actual_value not in actual_values:
-                                            actual_values.append(actual_value)
-                            finally:
-                                if hasattr(signal, 'SIGALRM'):
-                                    signal.alarm(0)  # Cancel the alarm
-                                    
-                        except TimeoutError:
-                            continue  # Skip this pattern if it takes too long
-                        except Exception:
+                    matches = pat.findall(text)
+                    if not matches:
+                        continue
+                    findings.append(f'{cat}:{pat.pattern[:60]}')
+                    for m in matches[:5]:
+                        val = (m if isinstance(m, str) else m[0] if m else '').strip()
+                        if not val or len(val) < 4:
                             continue
-                
-                # Create snippet
-                if findings:
-                    lines = text_content.split('\n')[:5]  # First 5 lines
-                    content_snippet = " ".join(lines)[:200]  # First 200 chars
-                
-        except Exception as e:
-            return [], [], f"Error reading file: {str(e)}"
-        
-        return findings, actual_values, content_snippet
+                        entry = f'{cat}:{val}'
+                        if entry not in values:
+                            values.append(entry)
+                        # Capture the line that contains this match (first hit wins)
+                        if not snippet:
+                            for line in text.splitlines():
+                                if val in line:
+                                    snippet = line.strip()[:200]
+                                    break
+                except Exception:
+                    continue
 
-    def extract_ooxml_metadata(self, filepath: str) -> Dict:
-        """Extract metadata from OOXML files."""
-        metadata = {}
-        
-        try:
-            with zipfile.ZipFile(filepath, 'r') as zip_file:
-                # Try to read core.xml
-                try:
-                    with zip_file.open('docProps/core.xml') as core_file:
-                        tree = ET.parse(core_file)
-                        root = tree.getroot()
-                        
-                        # Extract common metadata fields
-                        for elem in root.iter():
-                            tag = elem.tag.split('}')[-1]  # Remove namespace
-                            if tag in ['creator', 'lastModifiedBy', 'created', 'modified', 'application', 'company', 'template', 'totalTime']:
-                                metadata[tag] = elem.text
-                except KeyError:
-                    pass
-                
-                # Try to read app.xml
-                try:
-                    with zip_file.open('docProps/app.xml') as app_file:
-                        tree = ET.parse(app_file)
-                        root = tree.getroot()
-                        
-                        for elem in root.iter():
-                            tag = elem.tag.split('}')[-1]
-                            if tag in ['Application', 'Company', 'Manager']:
-                                metadata[tag.lower()] = elem.text
-                except KeyError:
-                    pass
-                    
-        except Exception as e:
-            metadata['error'] = str(e)
-        
-        return metadata
+        return findings, values, snippet
 
-    def scan_file(self, target: str, share: str, filepath: str, relative_path: str) -> Optional[ScanResult]:
-        """Scan a single file and return results."""
+    # Fields we extract from OOXML docProps
+    _CORE_FIELDS = {
+        'creator', 'lastModifiedBy', 'created', 'modified',
+        'lastPrinted', 'revision', 'description', 'subject', 'title',
+        'keywords', 'category', 'contentStatus',
+    }
+    _APP_FIELDS = {
+        'Application', 'AppVersion', 'Company', 'Manager',
+        'Template', 'DocSecurity', 'TotalTime',
+    }
+
+    def extract_ooxml_meta(self, data: bytes) -> Dict:
+        """Extract all useful metadata fields from an OOXML (Office) file."""
+        meta: Dict = {}
         try:
-            # Get file stats first to check size
-            stat_info = os.stat(filepath)
-            size = stat_info.st_size
-            last_write = datetime.fromtimestamp(stat_info.st_mtime).isoformat()
-            
-            filename = os.path.basename(filepath)
-            
-            # Determine action and reason
-            action, action_reason = self.get_file_action(relative_path, filename)
-            
-            # Skip files that should be skipped
-            if action == Action.SKIP:
-                return None
-            
-            # Skip very large files to prevent slow scanning
-            max_file_size = 50 * 1024 * 1024  # 50MB limit
-            if size > max_file_size:
-                if self.args.verbose:
-                    self.print_status(f"Skipping large file: {relative_path} ({self.format_size(size)})", target, share)
-                    self.clear_status()
-                return None
-            
-            # Show current file being scanned
-            self.print_status(f"Scanning: {relative_path}", target, share)
-            
-            # Initialize variables
-            findings = []
-            actual_values = []
-            content_snippet = ""
-            ooxml_meta = {}
-            errors = []
-            
-            # Scan content if appropriate (always enabled by default)
-            if action in [Action.DEEPSCAN, Action.QUICKPEEK]:
-                if action == Action.DEEPSCAN:
-                    findings, actual_values, content_snippet = self.scan_file_content(
-                        filepath, self.args.deepscan_max_bytes
-                    )
-                elif action == Action.QUICKPEEK and self.args.quickpeek:
-                    findings, actual_values, content_snippet = self.scan_file_content(
-                        filepath, self.args.quickpeek_max_bytes
-                    )
-                    ooxml_meta = self.extract_ooxml_metadata(filepath)
-            
-            # Determine interesting level
-            interesting, reason = self.get_interesting_level(relative_path, filename, findings)
-            
-            # Create result
-            result = ScanResult(
-                target=target,
-                share=share,
-                path=relative_path,
-                size=size,
-                last_write=last_write,
-                action=action.value,
-                reason=f"{action_reason},{reason}",
-                interesting=interesting.value,
-                findings=findings,
-                actual_values=actual_values,
-                content_snippet=content_snippet,
-                ooxml_meta=ooxml_meta,
-                errors=errors
-            )
-            
-            # Clear status line before printing result
-            self.clear_status()
-            
-            # Only print HIGH and MEDIUM priority results to console
-            # LOW priority results are still saved to results list and HTML summary
-            if result.interesting in ["HIGH", "MED"]:
-                self.print_result(result)
-            
-            return result
-            
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for xml_path, wanted in (
+                    ('docProps/core.xml', self._CORE_FIELDS),
+                    ('docProps/app.xml',  self._APP_FIELDS),
+                ):
+                    try:
+                        root = ET.parse(io.BytesIO(z.read(xml_path))).getroot()
+                        for el in root.iter():
+                            tag = el.tag.split('}')[-1]
+                            if tag in wanted and el.text and el.text.strip():
+                                meta[tag] = el.text.strip()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return meta
+
+    def analyse_ooxml_meta(self, meta: Dict, filename: str) -> Tuple[List[str], List[str]]:
+        """
+        Score OOXML metadata for intelligence value.
+        Returns (findings, actual_values) compatible with the main result format.
+        """
+        findings: List[str] = []
+        values:   List[str] = []
+
+        def _add(label: str, val: str, level: str = 'OfficeMeta'):
+            entry = f'{level}:{label}={val}'
+            if entry not in values:
+                values.append(entry)
+            tag = f'{level}:{label}'
+            if tag not in findings:
+                findings.append(tag)
+
+        # ── Usernames ─────────────────────────────────────────────────────────
+        for field in ('creator', 'lastModifiedBy'):
+            val = meta.get(field, '').strip()
+            if not val or val.lower() in ('unknown', 'user', 'admin', 'author'):
+                continue
+            _add(field, val, 'OfficeMeta')
+
+            # Detect domain\username pattern
+            if re.search(r'^[A-Za-z0-9_\-]+\\[A-Za-z0-9_\-\.]+$', val):
+                _add('DomainUser', val, 'OfficeMeta_High')
+            # Detect email address
+            elif re.search(r'@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', val):
+                _add('UserEmail', val, 'OfficeMeta_High')
+            # Detect firstname.lastname style → infer email format
+            elif re.search(r'^[A-Za-z]+\.[A-Za-z]+$', val):
+                _add('UsernameFormat', val, 'OfficeMeta')
+
+        # ── Organisation ──────────────────────────────────────────────────────
+        for field in ('Company', 'Manager'):
+            val = meta.get(field, '').strip()
+            if val and val.lower() not in ('', 'unknown', 'none'):
+                _add(field, val, 'OfficeMeta')
+
+        # ── Template — can leak internal UNC paths ────────────────────────────
+        tmpl = meta.get('Template', '').strip()
+        if tmpl and tmpl not in ('Normal', 'Normal.dotm', 'Normal.dot', ''):
+            _add('Template', tmpl, 'OfficeMeta')
+            # UNC path in template = internal file server
+            if tmpl.startswith('\\\\') or re.search(r'\\\\[A-Za-z0-9_\-]+\\', tmpl):
+                _add('InternalServer', tmpl, 'OfficeMeta_High')
+
+        # ── App version — reveals patch level ────────────────────────────────
+        app = meta.get('Application', '')
+        ver = meta.get('AppVersion', '')
+        if app or ver:
+            _add('OfficeVersion', f'{app} {ver}'.strip(), 'OfficeMeta')
+
+        # ── Revision count — high revision = actively used doc ────────────────
+        rev = meta.get('revision', '')
+        try:
+            if int(rev) > 20:
+                _add('HighRevision', f'rev={rev} file={filename}', 'OfficeMeta')
+        except (ValueError, TypeError):
+            pass
+
+        # ── Run all metadata text through main content patterns too ──────────
+        meta_blob = ' '.join(str(v) for v in meta.values()).encode()
+        extra_f, extra_v, _ = self.analyse_bytes(meta_blob, len(meta_blob) + 1)
+        findings += [f for f in extra_f if f not in findings]
+        values   += [v for v in extra_v if v not in values]
+
+        return findings, values
+
+    # ── SMB operations ────────────────────────────────────────────────────────
+
+    def _smb_connect(self, host: str) -> Optional['SMBConnection']:
+        if not HAS_IMPACKET:
+            return None
+        user   = self.args.username or ''
+        passwd = self.args.password or ''
+        domain = ''
+        if '\\' in user:
+            domain, user = user.split('\\', 1)
+        elif '@' in user:
+            user, domain = user.split('@', 1)
+
+        # Build credential candidates to try
+        if user:
+            cred_attempts = [(user, passwd, domain)]
+        else:
+            # No creds — try Guest first (servers often block null-session enum but allow Guest)
+            cred_attempts = [('Guest', '', ''), ('guest', '', ''), ('', '', '')]
+
+        for u, p, d in cred_attempts:
+            try:
+                conn = SMBConnection(host, host, sess_port=445, timeout=15)
+                conn.login(u, p, d)
+                if u:
+                    _write(f'  {Fore.GREEN}[auth] {host} logged in as {u or "null-session"}{Style.RESET_ALL}')
+                return conn
+            except Exception:
+                pass
+
+        _write(f'{Fore.RED}[-] {host}: all login attempts failed{Style.RESET_ALL}')
+        return None
+
+    # Common share names to probe when SRVSVC enumeration is denied
+    _FALLBACK_SHARES = [
+        # Admin / default Windows
+        'C$', 'D$', 'E$', 'F$', 'ADMIN$', 'IPC$', 'print$',
+        'Users', 'Public', 'Shared', 'Share', 'Shares',
+        'SYSVOL', 'NETLOGON',
+        # General
+        'Data', 'Files', 'Backup', 'Backups', 'Archive', 'Archives',
+        'Documents', 'Docs', 'Finance', 'HR', 'IT', 'Dev', 'Development',
+        'home', 'homes', 'Upload', 'Uploads', 'Drop', 'Dropbox',
+        'Storage', 'NAS', 'Media', 'Temp', 'Transfer',
+        # Web roots
+        'htdocs', 'wwwroot', 'www', 'web', 'webroot', 'Web',
+        'html', 'public_html', 'inetpub', 'sites', 'www-data',
+        'srv', 'site', 'root', 'apache', 'nginx',
+        # FTP / file transfer
+        'ftp', 'ftproot', 'ftp-data',
+        # Dev / source control
+        'repos', 'git', 'svn', 'code', 'source', 'src',
+        # CI/CD & DevOps
+        'jenkins', 'jenkins_home', 'jenkins-data',
+        'gitlab', 'gitlab-data', 'gitea',
+        'nexus', 'artifactory', 'sonar',
+        'bamboo', 'teamcity', 'travis',
+        'ansible', 'terraform', 'chef', 'puppet',
+        # Databases
+        'mysql', 'postgres', 'mssql', 'oracle', 'mongo',
+        'db', 'database', 'databases',
+        # Logs / monitoring
+        'logs', 'log', 'audit', 'elk', 'splunk', 'graylog',
+        # Docker / k8s
+        'docker', 'containers', 'kubernetes', 'k8s',
+        # Config / secrets
+        'config', 'configs', 'configuration',
+        'secrets', 'vault', 'certs', 'keys',
+        # App-specific
+        'exchange', 'mail', 'email',
+        'erp', 'crm', 'sap',
+        'jira', 'confluence', 'bitbucket',
+        'grafana', 'kibana', 'prometheus',
+    ]
+
+    def _list_shares(self, conn: 'SMBConnection') -> List[str]:
+        try:
+            raw = conn.listShares()
+            shares = [s['shi1_netname'].rstrip('\x00') for s in raw]
+            if shares:
+                return shares
         except Exception as e:
-            self.clear_status()
-            if self.args.verbose:
-                print(f"Error scanning {filepath}: {str(e)}")
+            _write(f'{Fore.YELLOW}[!] SRVSVC share enum denied ({e}), probing common share names...{Style.RESET_ALL}')
+
+        # Fallback: probe common share names by attempting to list their root
+        accessible = []
+        for share in self._FALLBACK_SHARES:
+            try:
+                conn.listPath(share, '\\*')
+                accessible.append(share)
+                _write(f'  {Fore.GREEN}[+] Accessible share: {share}{Style.RESET_ALL}')
+            except Exception:
+                pass
+        if accessible:
+            _write(f'  Found {len(accessible)} accessible shares via probing')
+        else:
+            _write(f'{Fore.YELLOW}  No accessible shares found (try -u/-p for credentials){Style.RESET_ALL}')
+        return accessible
+
+    def _read_file_smb(self, conn: 'SMBConnection', share: str, smb_path: str, max_bytes: int) -> bytes:
+        """Stream up to max_bytes from a remote file via SMB using getFile."""
+        buf = io.BytesIO()
+
+        def _cb(data: bytes):
+            remaining = max_bytes - buf.tell()
+            if remaining > 0:
+                buf.write(data[:remaining])
+
+        try:
+            conn.getFile(share, smb_path, _cb)
+        except Exception:
+            pass  # may raise on EOF or after partial read — that's fine
+        return buf.getvalue()
+
+    # ── Single file scan ──────────────────────────────────────────────────────
+
+    def _scan_file(
+        self,
+        conn: Optional['SMBConnection'],
+        target: str,
+        share: str,
+        smb_path: str,   # leading backslash, e.g. \Users\alice\config.env
+        size: int,
+        mtime: str,
+    ) -> Optional[ScanResult]:
+        filename = smb_path.replace('/', '\\').split('\\')[-1]
+        action, action_reason = self._get_action(filename)
+        if action == Action.SKIP:
+            return None
+        if size > 50 * 1024 * 1024:
             return None
 
-    def format_size(self, size_bytes: int) -> str:
-        """Format file size in human readable format."""
-        if size_bytes == 0:
-            return "0B"
-        
-        size_names = ["B", "KB", "MB", "GB", "TB"]
-        i = 0
-        while size_bytes >= 1024 and i < len(size_names) - 1:
-            size_bytes /= 1024.0
-            i += 1
-        
-        if i == 0:
-            return f"{size_bytes}B"
-        else:
-            return f"{size_bytes:.1f}{size_names[i]}"
+        findings, values, snippet = [], [], ''
+        ooxml: Dict = {}
+        max_b = self.args.deepscan_max_bytes if action == Action.DEEPSCAN else self.args.quickpeek_max_bytes
 
-    def print_result(self, result: ScanResult):
-        """Print a scan result with color coding."""
-        # Clear any status line before printing result
-        self.clear_status()
-        
-        # Determine color based on interesting level
-        if result.interesting == "HIGH":
-            color = Fore.RED + Style.BRIGHT
-        elif result.interesting == "MED":
-            color = Fore.YELLOW
-        else:
-            color = Fore.WHITE
-        
-        # Format the output line
-        size_str = self.format_size(result.size)
-        output_line = f"[{result.interesting}] {result.target}\\{result.share}\\{result.path} {size_str} ({result.action}; {result.reason})"
-        
-        # Print with color
-        print(f"{color}{output_line}{Style.RESET_ALL}")
-        
-        # Print findings if any
-        if result.actual_values:
-            print(f"  Found: {', '.join(result.actual_values[:3])}")  # Show first 3 findings
-            if len(result.actual_values) > 3:
-                print(f"  ... and {len(result.actual_values) - 3} more")
-        
-        # Print content snippet if available
-        if result.content_snippet and len(result.content_snippet.strip()) > 0:
-            snippet = result.content_snippet.strip()
-            if len(snippet) > 100:
-                snippet = snippet[:100] + "..."
-            print(f"  Content: {snippet}")
+        # meta-only mode: read office files for metadata even when --no-office skips content
+        no_office_content = getattr(self.args, 'no_office_content', False)
+        meta_only = action == Action.QUICKPEEK and no_office_content
 
-    def print_status(self, message: str, target: str = "", share: str = ""):
-        """Print a status message that will be overwritten."""
-        # Include server/share info in status if provided
-        if target and share:
-            full_message = f"🔍 {target}\\{share}\\{message}"
-        else:
-            full_message = f"🔍 {message}"
-        
-        # Truncate message if too long to prevent terminal overflow
-        max_length = 100  # Reduced from 120 to prevent overflow
-        if len(full_message) > max_length:
-            full_message = full_message[:max_length-3] + "..."
-        
-        # Clear the line completely and print status
-        print('\r' + ' ' * 120 + '\r', end='', flush=True)  # Reduced from 150
-        print(f"\r{full_message}", end='', flush=True)
-    
-    def clear_status(self):
-        """Clear the status line."""
-        # Clear with fewer spaces to reduce blank lines
-        print('\r' + ' ' * 120 + '\r', end='', flush=True)  # Reduced from 150
-    
-    def clear_and_print(self, message: str):
-        """Clear the current line and print a new message."""
-        self.clear_status()
-        print(message)
-    
-    def print_skip_message(self, directory: str, target: str = "", share: str = ""):
-        """Print skip message and ensure it stays at the bottom."""
-        # Clear the status line completely first
-        self.clear_status()
-        
-        # Print the skip message
-        if target and share:
-            print(f"⏭️  Skipping directory: {target}\\{share}\\{directory}")
-        else:
-            print(f"⏭️  Skipping directory: {directory}")
-        
-        # Don't add extra newline to reduce blank spaces
+        if conn and action in (Action.DEEPSCAN, Action.QUICKPEEK):
+            read_limit = 256 * 1024 if meta_only else max_b
+            data = self._read_file_smb(conn, share, smb_path, read_limit)
+            if data:
+                if not meta_only:
+                    findings, values, snippet = self.analyse_bytes(data, read_limit)
+                if action == Action.QUICKPEEK:
+                    ooxml = self.extract_ooxml_meta(data)
+                    if ooxml:
+                        mf, mv = self.analyse_ooxml_meta(ooxml, filename)
+                        findings += [f for f in mf if f not in findings]
+                        values   += [v for v in mv if v not in values]
 
-    def scan_directory(self, target: str, share: str, root_path: str, current_path: str = "", depth: int = 0):
-        """Recursively scan a directory."""
+        level, reason = self._get_level(
+            smb_path, filename, [f.split(':')[0] for f in findings]
+        )
+
+        return ScanResult(
+            target=target, share=share,
+            path=smb_path.lstrip('\\').lstrip('/'),
+            size=size, last_write=mtime,
+            action=action.value,
+            reason=f'{action_reason},{reason}',
+            interesting=level.value,
+            findings=findings, actual_values=values,
+            content_snippet=snippet, ooxml_meta=ooxml, errors=[],
+        )
+
+    # ── Directory recursion (SMB) ─────────────────────────────────────────────
+
+    def _scan_dir_smb(
+        self,
+        conn: 'SMBConnection',
+        target: str,
+        share: str,
+        smb_dir: str,   # path within share, no leading slash, e.g. '' or 'Users\\alice'
+        depth: int = 0,
+    ):
         if depth > self.args.max_depth:
             return
-        
-        full_path = os.path.join(root_path, current_path)
-        
-        # Show current directory being scanned
-        showing_directory_status = False
-        if current_path:
-            self.print_status(f"Scanning directory: {current_path} (Press 'S' to skip)", target, share)
-            showing_directory_status = True
-        
-        try:
-            # Add timeout protection for directory scanning
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Directory scanning timeout")
-            
-            # Set timeout for directory scanning (60 seconds)
-            if hasattr(signal, 'SIGALRM'):
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(60)
-            
-            try:
-                with os.scandir(full_path) as entries:
-                    file_count = 0
-                    max_files_per_dir = 1000  # Limit files per directory to prevent getting stuck
-                    
-                    for entry in entries:
-                        # Check for skip request (always interactive)
-                        if self.keyboard_handler.check_for_skip():
-                            self.print_skip_message(current_path, target, share)
-                            self.keyboard_handler.reset_skip_flag()
-                            return
-                        
-                        # Limit files per directory to prevent getting stuck
-                        if file_count >= max_files_per_dir:
-                            if self.args.verbose:
-                                print(f"⚠️  Directory {current_path} has too many files ({file_count}+) - skipping remaining files")
-                            break
-                        
-                        try:
-                            # Skip if should be excluded
-                            if self.args.exclude_dirs:
-                                for pattern in self.args.exclude_dirs:
-                                    if re.search(pattern, entry.name, re.IGNORECASE):
-                                        continue
-                            
-                            # Include only if specified
-                            if self.args.include_dirs:
-                                include_match = False
-                                for pattern in self.args.include_dirs:
-                                    if re.search(pattern, entry.name, re.IGNORECASE):
-                                        include_match = True
-                                        break
-                                if not include_match:
-                                    continue
-                            
-                            relative_path = os.path.join(current_path, entry.name).replace('/', '\\')
-                            
-                            # Check if path should be skipped
-                            if self.should_skip_path(relative_path):
-                                continue
-                            
-                            if entry.is_file():
-                                file_count += 1
-                                
-                                # Check file extension filters
-                                ext = Path(entry.name).suffix.lower()
-                                if self.args.include_ext and ext not in self.args.include_ext:
-                                    continue
-                                if self.args.exclude_ext and ext in self.args.exclude_ext:
-                                    continue
-                                
-                                # Clear directory status before scanning file
-                                if showing_directory_status:
-                                    self.clear_status()
-                                    showing_directory_status = False
-                                
-                                # Scan the file
-                                result = self.scan_file(target, share, entry.path, relative_path)
-                                if result:
-                                    with self.lock:
-                                        self.results.append(result)
-                            
-                            elif entry.is_dir() and not entry.is_symlink():
-                                # Recursively scan subdirectories
-                                self.scan_directory(target, share, root_path, relative_path, depth + 1)
-                        
-                        except PermissionError:
-                            if self.args.verbose:
-                                print(f"Permission denied: {entry.path}")
-                        except Exception as e:
-                            if self.args.verbose:
-                                print(f"Error processing {entry.path}: {str(e)}")
-            
-            finally:
-                if hasattr(signal, 'SIGALRM'):
-                    signal.alarm(0)  # Cancel the alarm
-                    
-        except TimeoutError:
-            if self.args.verbose:
-                print(f"⚠️  Directory scanning timeout for: {full_path}")
-        except PermissionError:
-            if self.args.verbose:
-                print(f"Permission denied accessing directory: {full_path}")
-        except Exception as e:
-            if self.args.verbose:
-                print(f"Error scanning directory {full_path}: {str(e)}")
-        
-        # Clear directory status at the end if it was showing
-        if showing_directory_status:
-            self.clear_status()
+        if self.kb.check_for_skip():
+            _write(f'  {Fore.YELLOW}⏭  Skipping: \\\\{target}\\{share}\\{smb_dir}{Style.RESET_ALL}')
+            self.kb.reset()
+            return
 
-    def net_use(self, host: str, username: str = None, password: str = None) -> bool:
-        """Establish SMB connection using net use command."""
-        if not username:
-            return True  # No authentication needed
-        
-        cmd = f'net use \\\\{host}'
-        if username:
-            cmd += f' /user:{username}'
-        if password:
-            cmd += f' {password}'
-        
+        search = ('\\' + smb_dir + '\\*') if smb_dir else '\\*'
+        search = re.sub(r'\\{2,}', '\\\\', search)  # collapse double backslashes
+
         try:
-            result = os.system(cmd)
-            return result == 0
-        except Exception as e:
-            if self.args.verbose:
-                print(f"Error establishing SMB connection: {str(e)}")
+            entries = conn.listPath(share, search)
+        except Exception:
+            return
+
+        files:   List[Tuple] = []
+        subdirs: List[str]   = []
+
+        for e in entries:
+            name = e.get_longname()
+            if name in ('.', '..'):
+                continue
+            child = (smb_dir + '\\' + name) if smb_dir else name
+
+            if e.is_directory():
+                # Fixed exclude_dirs: use any() so continue applies to outer loop
+                if self.args.exclude_dirs and any(
+                    re.search(p, name, re.IGNORECASE) for p in self.args.exclude_dirs
+                ):
+                    continue
+                if self.should_skip_path(child):
+                    continue
+                # apply include_dirs filter on the directory name
+                if self.args.include_dirs and not any(
+                    re.search(p, name, re.IGNORECASE) for p in self.args.include_dirs
+                ):
+                    continue
+                subdirs.append(child)
+            else:
+                ext = Path(name).suffix.lower()
+                if self.args.include_ext and ext not in self.args.include_ext:
+                    continue
+                if self.args.exclude_ext and ext in self.args.exclude_ext:
+                    continue
+                files.append((e, child))
+
+        max_fpd = getattr(self.args, 'max_files_per_dir', 1000)
+
+        for idx, (entry, fpath) in enumerate(files):
+            if idx >= max_fpd:
+                _write(f'{Fore.YELLOW}  [!] Dir limit ({max_fpd}) reached in \\{smb_dir}{Style.RESET_ALL}')
+                break
+            size  = entry.get_filesize()
+            mtime = self.format_mtime(entry.get_mtime())
+            result = self._scan_file(conn, target, share, '\\' + fpath, size, mtime)
+            self._tick(target, result)
+
+        for sub in subdirs:
+            self._scan_dir_smb(conn, target, share, sub, depth + 1)
+
+    # ── Directory recursion (local / mounted) ─────────────────────────────────
+
+    def _scan_dir_local(
+        self,
+        target: str,
+        share: str,
+        root: str,
+        rel: str = '',
+        depth: int = 0,
+    ):
+        if depth > self.args.max_depth:
+            return
+        full = os.path.join(root, rel) if rel else root
+        try:
+            entries = list(os.scandir(full))
+        except Exception:
+            return
+
+        count = 0
+        max_fpd = getattr(self.args, 'max_files_per_dir', 1000)
+
+        for entry in entries:
+            if self.kb.check_for_skip():
+                _write(f'  {Fore.YELLOW}⏭  Skipping: {full}{Style.RESET_ALL}')
+                self.kb.reset()
+                return
+
+            rel_path = os.path.join(rel, entry.name).replace('/', '\\') if rel else entry.name
+
+            if entry.is_dir(follow_symlinks=False):
+                if self.args.exclude_dirs and any(
+                    re.search(p, entry.name, re.IGNORECASE) for p in self.args.exclude_dirs
+                ):
+                    continue
+                if self.should_skip_path(rel_path):
+                    continue
+                self._scan_dir_local(target, share, root, rel_path, depth + 1)
+            elif entry.is_file():
+                if count >= max_fpd:
+                    break
+                count += 1
+                try:
+                    st    = entry.stat()
+                    size  = st.st_size
+                    mtime = self.format_mtime(datetime.fromtimestamp(st.st_mtime).isoformat())
+                    action, action_reason = self._get_action(entry.name)
+                    if action == Action.SKIP or size > 50 * 1024 * 1024:
+                        self._tick(target, None)
+                        continue
+
+                    findings, values, snippet = [], [], ''
+                    ooxml: Dict = {}
+                    max_b = self.args.deepscan_max_bytes if action == Action.DEEPSCAN else self.args.quickpeek_max_bytes
+
+                    no_office_content = getattr(self.args, 'no_office_content', False)
+                    meta_only = action == Action.QUICKPEEK and no_office_content
+                    if action in (Action.DEEPSCAN, Action.QUICKPEEK):
+                        try:
+                            read_limit = 256 * 1024 if meta_only else max_b
+                            with open(entry.path, 'rb') as f:
+                                data = f.read(read_limit)
+                            if not meta_only:
+                                findings, values, snippet = self.analyse_bytes(data, read_limit)
+                            if action == Action.QUICKPEEK:
+                                ooxml = self.extract_ooxml_meta(data)
+                                if ooxml:
+                                    mf, mv = self.analyse_ooxml_meta(ooxml, entry.name)
+                                    findings += [f for f in mf if f not in findings]
+                                    values   += [v for v in mv if v not in values]
+                        except Exception:
+                            pass
+
+                    level, reason = self._get_level(
+                        rel_path, entry.name, [f.split(':')[0] for f in findings]
+                    )
+                    result = ScanResult(
+                        target=target, share=share, path=rel_path,
+                        size=size, last_write=mtime,
+                        action=action.value, reason=f'{action_reason},{reason}',
+                        interesting=level.value,
+                        findings=findings, actual_values=values,
+                        content_snippet=snippet, ooxml_meta=ooxml, errors=[],
+                    )
+                    self._tick(target, result)
+                except Exception:
+                    pass
+
+    # ── Live output helpers ───────────────────────────────────────────────────
+
+    def _open_live_outputs(self):
+        """Open CSV/JSONL files and write CSV header immediately."""
+        if getattr(self.args, 'jsonl', None):
+            self._jsonl_file = open(self.args.jsonl, 'w', encoding='utf-8')
+        if getattr(self.args, 'csv', None):
+            self._csv_file = open(self.args.csv, 'w', newline='', encoding='utf-8')
+            # Write header using field names from the dataclass
+            from dataclasses import fields as dc_fields
+            fieldnames = [f.name for f in dc_fields(ScanResult)]
+            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
+            self._csv_writer.writeheader()
+            self._csv_file.flush()
+
+    def _close_live_outputs(self):
+        if self._jsonl_file:
+            self._jsonl_file.close()
+            self._jsonl_file = None
+        if self._csv_file:
+            self._csv_file.close()
+            self._csv_file = None
+
+    def _write_result_live(self, result: ScanResult):
+        """Append a single result to open CSV/JSONL files immediately."""
+        with self._io_lock:
+            if self._jsonl_file:
+                self._jsonl_file.write(json.dumps(asdict(result), ensure_ascii=False) + '\n')
+                self._jsonl_file.flush()
+            if self._csv_writer and self._csv_file:
+                row = asdict(result)
+                for k in ('findings', 'actual_values', 'errors'):
+                    row[k] = '; '.join(row[k])
+                row['ooxml_meta'] = json.dumps(row['ooxml_meta'])
+                self._csv_writer.writerow(row)
+                self._csv_file.flush()
+
+    # ── Progress + result storage ─────────────────────────────────────────────
+
+    def _tick(self, target: str, result: Optional[ScanResult]):
+        """Update progress bar and store result."""
+        if self.pbar is not None:
+            self.pbar.update(1)
+        if result:
+            with self.lock:
+                self.results.append(result)
+            with self._cnt_lock:
+                self._cnt[result.interesting] += 1
+            self._write_result_live(result)
+            if result.interesting in ('HIGH', 'MED'):
+                self._print_result(result)
+            if self.pbar is not None:
+                self.pbar.set_postfix(
+                    {'H': self._cnt['HIGH'], 'M': self._cnt['MED'], 'host': target[:15]},
+                    refresh=False,
+                )
+
+    # ── Share & target scanning ───────────────────────────────────────────────
+
+    def _scan_share(self, target: str, share: str):
+        conn = self._smb_connect(target)
+        if not conn:
+            return
+        _write(f'{Fore.CYAN}  [*] \\\\{target}\\{share}{Style.RESET_ALL}')
+        try:
+            self._scan_dir_smb(conn, target, share, '', depth=0)
+        finally:
+            try:
+                conn.logoff()
+            except Exception:
+                pass
+
+    def _scan_target(self, target_str: str):
+        host, spec_share, _subpath = self._parse_target(target_str)
+
+        conn = self._smb_connect(host)
+        if not conn:
+            return
+
+        _write(f'\n{Fore.GREEN}[+] Connected to {host}{Style.RESET_ALL}')
+
+        if spec_share:
+            shares = [spec_share]
+        else:
+            shares = self._list_shares(conn)
+            _write(f'    Shares found: {", ".join(shares) or "(none)"}')
+
+        # Apply share filters
+        if self.args.include_shares:
+            inc = {s.strip() for s in self.args.include_shares.split(',')}
+            shares = [s for s in shares if s in inc]
+        if self.args.exclude_shares:
+            exc = {s.strip() for s in self.args.exclude_shares.split(',')}
+            shares = [s for s in shares if s not in exc]
+        if not getattr(self.args, 'include_admin_shares', False):
+            shares = [s for s in shares if not s.endswith('$')]
+
+        if not shares:
+            _write(f'{Fore.YELLOW}  [!] No shares to scan on {host}{Style.RESET_ALL}')
+
+        try:
+            conn.logoff()
+        except Exception:
+            pass
+
+        if not shares:
+            return
+
+        _write(f'    Scanning: {", ".join(shares)}')
+
+        host_timeout = getattr(self.args, 'host_timeout', None)
+
+        def _scan_shares_with_timeout():
+            if self.args.threads > 1:
+                with ThreadPoolExecutor(max_workers=min(self.args.threads, len(shares))) as ex:
+                    futs = {ex.submit(self._scan_share, host, s): s for s in shares}
+                    for fut in as_completed(futs):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            _write(f'{Fore.RED}  [!] Error scanning {futs[fut]}: {e}{Style.RESET_ALL}')
+            else:
+                for s in shares:
+                    self._scan_share(host, s)
+
+        if host_timeout:
+            import concurrent.futures
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_scan_shares_with_timeout)
+                try:
+                    fut.result(timeout=host_timeout)
+                except concurrent.futures.TimeoutError:
+                    _write(f'{Fore.YELLOW}  [!] {host} timed out after {host_timeout}s — moving on{Style.RESET_ALL}')
+                except Exception as e:
+                    _write(f'{Fore.RED}  [!] {host} error: {e}{Style.RESET_ALL}')
+        else:
+            _scan_shares_with_timeout()
+
+    # ── Target parsing & expansion ────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_target(target: str) -> Tuple[str, Optional[str], Optional[str]]:
+        t = target.strip().replace('/', '\\')
+        if t.startswith('\\\\'):
+            parts = t[2:].split('\\')
+            host  = parts[0]
+            share = parts[1] if len(parts) > 1 and parts[1] else None
+            sub   = '\\'.join(parts[2:]) if len(parts) > 2 else None
+            return host, share, sub
+        return target.strip(), None, None
+
+    @staticmethod
+    def _check_port(host: str, port: int = 445, timeout: float = 2.0) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
             return False
 
-    def net_view(self, host: str) -> List[str]:
-        """Get list of shares from a host using net view command."""
+    @staticmethod
+    def _expand_cidr(target: str) -> List[str]:
+        host, share, _ = SMBScanner._parse_target(target)
         try:
-            import subprocess
-            # Run net view command
-            result = subprocess.run(
-                ['net', 'view', f'\\\\{host}'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if self.args.verbose:
-                print(f"Net view output for \\\\{host}:")
-                print(f"Return code: {result.returncode}")
-                print(f"Stdout:\n{result.stdout}")
-                print(f"Stderr:\n{result.stderr}")
-            
-            shares = []
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                
-                # Skip header lines and look for actual share names
-                for line in lines:
-                    line = line.strip()
-                    # Skip empty lines, headers, and separator lines
-                    if not line or line.startswith('Shared resources') or line.startswith('Share name') or line.startswith('---') or line.startswith('\\\\'):
-                        continue
-                    
-                    # Extract share name (first word before spaces)
-                    parts = line.split()
-                    if parts:
-                        share_name = parts[0]
-                        # Skip if it looks like a header or system info
-                        if share_name.lower() in ['samba', 'type', 'used', 'comment', 'name']:
-                            continue
-                        shares.append(share_name)
-            
-            if self.args.verbose:
-                print(f"Found shares: {shares}")
-            
-            return shares
-            
-        except subprocess.TimeoutExpired:
-            print(f"Timeout getting shares from {host}")
-            return []
-        except Exception as e:
-            print(f"Error getting shares from {host}: {e}")
-            return []
+            net = ipaddress.ip_network(host, strict=False)
+            if net.num_addresses == 1:
+                return [target]
+            # Return targets preserving any share/path suffix
+            suffix = target[len(host):]
+            return [str(ip) + suffix for ip in net.hosts()]
+        except ValueError:
+            return [target]
 
-    def scan_share(self, target: str, share: str, subpath: str = ""):
-        """Scan a specific SMB share."""
-        if self.args.path_unc:
-            # Direct UNC path scanning
-            root_path = self.args.path_unc
-        else:
-            # Construct UNC path
-            root_path = f"\\\\{target}\\{share}"
-            if subpath:
-                root_path = os.path.join(root_path, subpath)
-        
-        print(f"Scanning: {root_path}")
-        
-        if not os.path.exists(root_path):
-            print(f"Path does not exist: {root_path}")
+    # ── Console output ────────────────────────────────────────────────────────
+
+    def _print_result(self, r: ScanResult):
+        color = Fore.RED + Style.BRIGHT if r.interesting == 'HIGH' else Fore.YELLOW
+        line  = f'[{r.interesting}] \\\\{r.target}\\{r.share}\\{r.path}  ({self.format_size(r.size)})'
+        _write(f'{color}{line}{Style.RESET_ALL}')
+        for v in r.actual_values[:3]:
+            _write(f'         {Fore.CYAN}{v}{Style.RESET_ALL}')
+        if len(r.actual_values) > 3:
+            _write(f'         ... +{len(r.actual_values) - 3} more')
+        if r.content_snippet:
+            _write(f'         {Fore.WHITE}{r.content_snippet[:120]}{Style.RESET_ALL}')
+
+    def _print_high_summary(self):
+        high = [r for r in self.results if r.interesting == 'HIGH']
+        if not high:
             return
-        
-        self.scan_directory(target, share, root_path)
+        print(f'\n{"=" * 60}')
+        print(f'{Fore.RED}🔥 HIGH PRIORITY FINDINGS SUMMARY{Style.RESET_ALL}')
+        print('=' * 60)
+        cats: Dict[str, list] = {}
+        for r in high:
+            for v in r.actual_values:
+                if ':' in v:
+                    cat, val = v.split(':', 1)
+                    cats.setdefault(cat, []).append({
+                        'value': val,
+                        'source': f'\\\\{r.target}\\{r.share}\\{r.path}',
+                        'snippet': self._targeted_snippet(r.content_snippet, val),
+                    })
+        for cat, items in cats.items():
+            print(f'\n{Fore.CYAN}{cat.upper()} ({len(items)}){Style.RESET_ALL}')
+            print('-' * 50)
+            for i, item in enumerate(items, 1):
+                print(f'  {i}. {item["value"]}')
+                print(f'     {item["source"]}')
+                if item['snippet']:
+                    print(f'     {item["snippet"]}')
+        print('=' * 60)
+
+    @staticmethod
+    def _targeted_snippet(content: str, value: str) -> str:
+        if not content or not value:
+            return content or ''
+        pos = content.find(value.strip())
+        if pos == -1:
+            return content[:80] + ('...' if len(content) > 80 else '')
+        start = max(0, pos - 20)
+        end   = min(len(content), pos + len(value) + 20)
+        out   = content[start:end]
+        if start > 0:  out = '...' + out
+        if end < len(content): out += '...'
+        return out
+
+    # ── Save results ──────────────────────────────────────────────────────────
 
     def save_results(self):
-        """Save results to JSONL and CSV files."""
-        if not self.results:
-            print("No results to save.")
-            return
-        
-        # Save JSONL
-        if self.args.jsonl:
-            with open(self.args.jsonl, 'w', encoding='utf-8') as f:
-                for result in self.results:
-                    f.write(json.dumps(asdict(result), ensure_ascii=False) + '\n')
-            print(f"Results saved to {self.args.jsonl}")
-        
-        # Save CSV
-        if self.args.csv:
-            with open(self.args.csv, 'w', newline='', encoding='utf-8') as f:
-                if self.results:
-                    fieldnames = asdict(self.results[0]).keys()
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    for result in self.results:
-                        # Convert lists to semicolon-separated strings for CSV
-                        row = asdict(result)
-                        row['findings'] = ';'.join(row['findings'])
-                        row['actual_values'] = ';'.join(row['actual_values'])
-                        row['errors'] = ';'.join(row['errors'])
-                        writer.writerow(row)
-            print(f"Results saved to {self.args.csv}")
+        """Live writes already handled by _write_result_live; just print summary."""
+        if getattr(self.args, 'jsonl', None):
+            print(f'JSONL → {self.args.jsonl} ({len(self.results)} records)')
+        if getattr(self.args, 'csv', None):
+            print(f'CSV   → {self.args.csv} ({len(self.results)} records)')
 
-    def parse_target(self, target: str) -> Tuple[str, Optional[str], Optional[str]]:
-        """Parse target string to extract host, share, and subpath."""
-        target = target.strip()
-        
-        # Handle different formats
-        if target.startswith('\\\\'):
-            # UNC path format: \\host\share\path
-            parts = target[2:].split('\\')
-            host = parts[0]
-            if len(parts) > 1 and parts[1]:
-                share = parts[1]
-                subpath = '\\'.join(parts[2:]) if len(parts) > 2 else None
-                return host, share, subpath
-            else:
-                # \\host\ or \\host format - no specific share
-                return host, None, None
-        else:
-            # Just hostname/IP
-            return target, None, None
+    # ── Main run ──────────────────────────────────────────────────────────────
 
     def run(self):
-        """Main execution method."""
-        print("SMB Sensitive Strings Scanner")
-        print("=" * 40)
-        
-        # Always show interactive message
+        print(f'{Fore.CYAN}SMB Sensitive Strings Scanner v2{Style.RESET_ALL}')
+        print('=' * 40)
+
+        if not HAS_IMPACKET and not getattr(self.args, 'mounted_root', None):
+            print(f'{Fore.RED}ERROR: impacket not installed.{Style.RESET_ALL}')
+            print('  pip install impacket')
+            sys.exit(1)
+
         if KEYBOARD_AVAILABLE:
-            print("🔧 Interactive mode enabled - Press 'S' to skip current folder")
-        else:
-            print("⚠️  Interactive mode not available on this platform")
-            print("   Continuing in non-interactive mode")
-        
-        if self.args.dry_run:
-            print("DRY RUN MODE - No actual scanning will be performed")
-            return
-        
-        if self.args.path_unc:
-            # Scan specific UNC path
-            target = "LOCAL"
-            share = "UNC"
-            self.scan_share(target, share)
-        elif self.args.mounted_root:
-            # Scan mounted CIFS path
-            target = "MOUNTED"
-            share = "CIFS"
-            self.scan_share(target, share, self.args.mounted_root)
-        else:
-            # Scan targets from file or command line
-            targets = []
-            if self.args.targets_file:
-                with open(self.args.targets_file, 'r') as f:
-                    targets = [line.strip() for line in f if line.strip()]
-            elif self.args.target:
-                targets = [self.args.target]
-            
-            for target_str in targets:
-                # Parse target to extract host, share, and subpath
-                host, specific_share, subpath = self.parse_target(target_str)
-                
-                print(f"\nScanning target: {target_str}")
-                print(f"Parsed: Host={host}, Share={specific_share}, Subpath={subpath}")
-                
-                # Establish connection
-                if not self.net_use(host, self.args.username, self.args.password):
-                    print(f"Failed to connect to {host}")
-                    continue
-                
-                if specific_share:
-                    # Specific share was provided in target
-                    print(f"Scanning specific share: {specific_share}")
-                    self.scan_share(host, specific_share, subpath or "")
+            print("Press 'S' during scan to skip the current directory.")
+
+        pbar_fmt = '{desc}: {n_fmt} {unit} [{elapsed}, {rate_fmt}] {postfix}'
+        self.pbar = tqdm(desc='Files', unit='file', dynamic_ncols=True,
+                         bar_format=pbar_fmt, total=0) if HAS_TQDM else None
+
+        self._open_live_outputs()
+
+        try:
+            if getattr(self.args, 'mounted_root', None):
+                target = 'MOUNTED'
+                share  = os.path.basename(self.args.mounted_root.rstrip('/\\')) or 'CIFS'
+                _write(f'[*] Scanning mounted path: {self.args.mounted_root}')
+                self._scan_dir_local(target, share, self.args.mounted_root)
+
+            else:
+                raw_targets: List[str] = []
+                if getattr(self.args, 'targets_file', None):
+                    with open(self.args.targets_file) as f:
+                        raw_targets = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+                elif getattr(self.args, 'target', None):
+                    raw_targets = [self.args.target]
+
+                # Expand CIDRs
+                expanded: List[str] = []
+                for t in raw_targets:
+                    hosts = self._expand_cidr(t)
+                    if len(hosts) > 1:
+                        _write(f'[*] {t} → {len(hosts)} hosts, probing port 445...')
+                        alive: List[str] = []
+                        with ThreadPoolExecutor(max_workers=100) as ex:
+                            fmap = {ex.submit(self._check_port, h.split('\\')[0].split('/')[0]): h
+                                    for h in hosts}
+                            for fut in as_completed(fmap):
+                                h = fmap[fut]
+                                if fut.result():
+                                    alive.append(h)
+                                    _write(f'  {Fore.GREEN}[+] {h}:445 open{Style.RESET_ALL}')
+                        _write(f'  → {len(alive)} hosts with SMB open')
+                        expanded.extend(alive)
+                    else:
+                        expanded.extend(hosts)
+
+                if not expanded:
+                    _write(f'{Fore.YELLOW}[!] No targets to scan.{Style.RESET_ALL}')
+
+                # Parallel host scanning
+                host_threads = getattr(self.args, 'host_threads', 1)
+                if host_threads > 1:
+                    _write(f'[*] Scanning {len(expanded)} hosts with {host_threads} parallel host threads')
+                    with ThreadPoolExecutor(max_workers=host_threads) as ex:
+                        futs = {ex.submit(self._scan_target, t): t for t in expanded}
+                        for fut in as_completed(futs):
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                _write(f'{Fore.RED}[!] Error: {e}{Style.RESET_ALL}')
                 else:
-                    # No specific share - enumerate all shares
-                    shares = self.net_view(host)
-                    
-                    # If no shares found and include_shares is specified, use those
-                    if not shares and self.args.include_shares:
-                        print(f"No shares found via net view, using specified shares: {self.args.include_shares}")
-                        shares = [s.strip() for s in self.args.include_shares.split(',')]
-                    elif not shares:
-                        print(f"No shares found for {host}. Try using --include-shares to specify shares manually.")
-                        print("Example: --include-shares 'C$,Users,Public'")
-                        continue
-                    
-                    # Filter shares
-                    if self.args.include_shares:
-                        include_list = [s.strip() for s in self.args.include_shares.split(',')]
-                        shares = [s for s in shares if s in include_list]
-                    
-                    if self.args.exclude_shares:
-                        exclude_list = [s.strip() for s in self.args.exclude_shares.split(',')]
-                        shares = [s for s in shares if s not in exclude_list]
-                    
-                    if not self.args.include_admin_shares:
-                        shares = [s for s in shares if not s.endswith('$')]
-                    
-                    print(f"Found shares: {', '.join(shares)}")
-                    
-                    if not shares:
-                        print(f"No shares to scan for {host} after filtering.")
-                        continue
-                    
-                    # Scan each share
-                    for share in shares:
-                        self.scan_share(host, share)
-        
-        # Save results
+                    for t in expanded:
+                        self._scan_target(t)
+
+        finally:
+            if self.pbar is not None:
+                self.pbar.close()
+            self._close_live_outputs()
+
         self.save_results()
-        
-        # Print summary
-        print(f"\nScan completed. Found {len(self.results)} interesting files.")
-        
-        # Count by interesting level
-        high_count = sum(1 for r in self.results if r.interesting == "HIGH")
-        med_count = sum(1 for r in self.results if r.interesting == "MED")
-        low_count = sum(1 for r in self.results if r.interesting == "LOW")
-        
-        print(f"  HIGH: {high_count}")
-        print(f"  MED:  {med_count}")
-        print(f"  LOW:  {low_count}")
-        
-        # Print detailed HIGH priority summary
-        if high_count > 0:
-            self.print_high_priority_summary()
-        
-        # Generate HTML summary
         self.generate_html_summary()
 
-    def print_high_priority_summary(self):
-        """Print a detailed summary of all HIGH priority findings grouped by category."""
-        print(f"\n{'='*60}")
-        print("🔥 HIGH PRIORITY FINDINGS SUMMARY")
-        print(f"{'='*60}")
-        
-        # Get all HIGH priority results
-        high_results = [r for r in self.results if r.interesting == "HIGH"]
-        
-        # Group by category
-        categories = {}
-        for result in high_results:
-            for actual_value in result.actual_values:
-                # Extract category from actual_value (format: "Category:value")
-                if ':' in actual_value:
-                    category, value = actual_value.split(':', 1)
-                    if category not in categories:
-                        categories[category] = []
-                    
-                    # Create a more targeted content snippet
-                    targeted_content = self.create_targeted_snippet(result.content_snippet, value)
-                    
-                    categories[category].append({
-                        'value': value,
-                        'source': f"{result.target}\\{result.share}\\{result.path}",
-                        'content_snippet': targeted_content
-                    })
-        
-        if not categories:
-            print("No categorized HIGH priority findings found.")
-            return
-        
-        # Print each category
-        for category, findings in categories.items():
-            print(f"\n🔍 {category.upper()} FINDINGS ({len(findings)} items):")
-            print("-" * 50)
-            
-            for i, finding in enumerate(findings, 1):
-                print(f"{i}. {finding['value']}")
-                print(f"   📁 Source: {finding['source']}")
-                if finding['content_snippet']:
-                    print(f"   📄 Context: {finding['content_snippet']}")
-                print()
-        
-        print(f"{'='*60}")
-        print(f"Total HIGH priority findings: {len(high_results)} files with {sum(len(findings) for findings in categories.values())} sensitive items")
-        print(f"{'='*60}")
+        h, m, l = self._cnt['HIGH'], self._cnt['MED'], self._cnt['LOW']
+        print(f'\n{"=" * 40}')
+        print(f'Scan complete — {h + m + l} interesting files found.')
+        print(f'  {Fore.RED}HIGH: {h}{Style.RESET_ALL}')
+        print(f'  {Fore.YELLOW}MED:  {m}{Style.RESET_ALL}')
+        print(f'  LOW:  {l}')
+        if h:
+            self._print_high_summary()
 
-    def create_targeted_snippet(self, content_snippet: str, found_value: str) -> str:
-        """Create a targeted snippet showing the context around the found sensitive data."""
-        if not content_snippet or not found_value:
-            return content_snippet
-        
-        content = content_snippet.strip()
-        value_clean = found_value.strip()
-        
-        pos = content.find(value_clean)
-        if pos == -1:
-            for word in value_clean.split():
-                pos = content.find(word)
-                if pos != -1:
-                    value_clean = word
-                    break
-        
-        if pos != -1:
-            start = max(0, pos - 20)
-            end = min(len(content), pos + len(value_clean) + 20)
-            context = content[start:end]
-            if start > 0:
-                context = "..." + context
-            if end < len(content):
-                context = context + "..."
-            return context
-        
-        return content_snippet[:80] + "..." if len(content_snippet) > 80 else content_snippet
+    # ── HTML report ───────────────────────────────────────────────────────────
 
-    def generate_html_summary(self, output_file: str = "scan_summary.html"):
-        """Generate an HTML summary report with collapsible groups organized by asset types."""
+    def generate_html_summary(self, output_file: str = 'scan_summary.html'):
         if not self.results:
-            print("No results to generate HTML summary.")
             return
-        
-        # Group results by priority level
-        high_results = [r for r in self.results if r.interesting == "HIGH"]
-        med_results = [r for r in self.results if r.interesting == "MED"]
-        low_results = [r for r in self.results if r.interesting == "LOW"]
-        
-        # Organize findings by asset type
-        asset_groups = self._organize_by_asset_type()
-        
-        # Build command and scan path information
-        scan_info = self._build_scan_info()
-        
-        # Generate HTML
-        html_content = f"""
-<!DOCTYPE html>
+
+        high_r  = [r for r in self.results if r.interesting == 'HIGH']
+        med_r   = [r for r in self.results if r.interesting == 'MED']
+        low_r   = [r for r in self.results if r.interesting == 'LOW']
+        # Office meta: files with any OfficeMeta finding
+        office_meta_r = [r for r in self.results if r.ooxml_meta]
+        groups  = self._organize_by_asset_type()
+        info    = self._build_scan_info()
+
+        html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SMB Scanner - {scan_info['target_display']}</title>
+    <title>SMB Scanner — {info['target_display']}</title>
     <style>
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }}
-        .container {{
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            overflow: hidden;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }}
-        .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }}
-        .header h1 {{
-            margin: 0;
-            font-size: 2.5em;
-            font-weight: 300;
-        }}
-        .header .subtitle {{
-            margin-top: 10px;
-            opacity: 0.9;
-            font-size: 1.1em;
-        }}
-        .scan-info {{
-            background: #e9ecef;
-            padding: 15px 20px;
-            border-bottom: 1px solid #dee2e6;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-        }}
-        .scan-info .label {{
-            font-weight: bold;
-            color: #495057;
-        }}
-        .scan-info .value {{
-            color: #6c757d;
-            margin-left: 10px;
-        }}
-        .stats {{
-            display: flex;
-            justify-content: space-around;
-            padding: 20px;
-            background: #f8f9fa;
-            border-bottom: 1px solid #dee2e6;
-        }}
-        .content-area {{
-            flex: 1;
-            overflow-y: auto;
-            padding: 20px;
-        }}
-        .summary-section {{
-            background: #f8f9fa;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 30px;
-            border: 1px solid #dee2e6;
-        }}
-        .summary-section h2 {{
-            margin: 0 0 20px 0;
-            color: #495057;
-            font-size: 1.5em;
-        }}
-        .summary-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-        }}
-        .summary-item {{
-            text-align: center;
-            padding: 15px;
-            background: white;
-            border-radius: 6px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }}
-        .summary-number {{
-            font-size: 2em;
-            font-weight: bold;
-            color: #495057;
-            margin-bottom: 5px;
-        }}
-        .summary-label {{
-            color: #6c757d;
-            font-size: 0.9em;
-        }}
-        .content-area h2 {{
-            color: #495057;
-            margin: 30px 0 20px 0;
-            font-size: 1.8em;
-            border-bottom: 2px solid #dee2e6;
-            padding-bottom: 10px;
-        }}
-        .stat {{
-            text-align: center;
-        }}
-        .stat-number {{
-            font-size: 2em;
-            font-weight: bold;
-            color: #495057;
-        }}
-        .stat-label {{
-            color: #6c757d;
-            font-size: 0.9em;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }}
-        .asset-group {{
-            margin: 10px 0;
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }}
-        .asset-header {{
-            padding: 20px;
-            color: white;
-            font-size: 1.4em;
-            font-weight: bold;
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: background-color 0.3s;
-        }}
-        .asset-header:hover {{
-            opacity: 0.9;
-        }}
-        .asset-header.network {{
-            background: linear-gradient(135deg, #4facfe, #00f2fe);
-        }}
-        .asset-header.credentials {{
-            background: linear-gradient(135deg, #ff6b6b, #ee5a52);
-        }}
-        .asset-header.files {{
-            background: linear-gradient(135deg, #feca57, #ff9ff3);
-        }}
-        .asset-header.folders {{
-            background: linear-gradient(135deg, #48dbfb, #0abde3);
-        }}
-        .asset-header.emails {{
-            background: linear-gradient(135deg, #a8edea, #fed6e3);
-        }}
-        .asset-content {{
-            max-height: 0;
-            overflow: hidden;
-            transition: max-height 0.3s ease-out;
-        }}
-        .asset-content.expanded {{
-            max-height: 600px;
-            overflow-y: auto;
-        }}
-        .priority-section {{
-            margin: 15px;
-            border-radius: 6px;
-            overflow: hidden;
-            border: 1px solid #e9ecef;
-            max-height: 400px;
-            overflow-y: auto;
-        }}
-        .priority-header {{
-            padding: 12px 15px;
-            font-weight: bold;
-            color: white;
-            font-size: 1.1em;
-        }}
-        .priority-header.high {{
-            background: #dc3545;
-        }}
-        .priority-header.med {{
-            background: #ffc107;
-            color: #212529;
-        }}
-        .priority-header.low {{
-            background: #17a2b8;
-        }}
-        .finding-item {{
-            padding: 15px;
-            border-bottom: 1px solid #f1f3f4;
-            transition: background-color 0.2s;
-        }}
-        .finding-item:hover {{
-            background-color: #f8f9fa;
-        }}
-        .finding-item:last-child {{
-            border-bottom: none;
-        }}
-        .finding-value {{
-            font-weight: bold;
-            color: #2c3e50;
-            margin-bottom: 8px;
-            font-size: 1.1em;
-            background: #fff3cd;
-            padding: 8px 12px;
-            border-radius: 4px;
-            border-left: 4px solid #ffc107;
-            word-break: break-all;
-        }}
-        .finding-source {{
-            color: #6c757d;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-            margin-bottom: 5px;
-        }}
-        .finding-context {{
-            background: #f8f9fa;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.85em;
-            color: #495057;
-            border-left: 3px solid #007bff;
-        }}
-        .empty-section {{
-            padding: 40px;
-            text-align: center;
-            color: #6c757d;
-            font-style: italic;
-        }}
-        .timestamp {{
-            text-align: center;
-            padding: 20px;
-            color: #6c757d;
-            font-size: 0.9em;
-            border-top: 1px solid #dee2e6;
-        }}
-        .toggle-icon {{
-            font-size: 1.2em;
-            transition: transform 0.3s;
-        }}
-        .toggle-icon.expanded {{
-            transform: rotate(180deg);
-        }}
+        body{{font-family:'Segoe UI',sans-serif;margin:0;padding:20px;background:#f5f5f5}}
+        .container{{max-width:1200px;margin:0 auto;background:white;border-radius:10px;
+                    box-shadow:0 2px 10px rgba(0,0,0,.1);overflow:hidden;display:flex;flex-direction:column}}
+        .header{{background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:30px;text-align:center}}
+        .header h1{{margin:0;font-size:2.2em;font-weight:300}}
+        .scan-info{{background:#e9ecef;padding:12px 20px;border-bottom:1px solid #dee2e6;
+                    font-family:monospace;font-size:.9em}}
+        .scan-info .label{{font-weight:bold;color:#495057}}
+        .scan-info .value{{color:#6c757d;margin-left:8px}}
+        .stats{{display:flex;justify-content:space-around;padding:20px;background:#f8f9fa;
+                border-bottom:1px solid #dee2e6}}
+        .stat{{text-align:center}}
+        .stat-number{{font-size:2em;font-weight:bold}}
+        .stat-label{{color:#6c757d;font-size:.85em;text-transform:uppercase;letter-spacing:1px}}
+        .content-area{{flex:1;overflow-y:auto;padding:20px}}
+        .summary-section{{background:#f8f9fa;border-radius:8px;padding:20px;margin-bottom:30px;
+                           border:1px solid #dee2e6}}
+        .summary-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}}
+        .summary-item{{text-align:center;padding:15px;background:white;border-radius:6px;
+                        box-shadow:0 1px 3px rgba(0,0,0,.1)}}
+        .summary-number{{font-size:2em;font-weight:bold;color:#495057}}
+        .summary-label{{color:#6c757d;font-size:.85em}}
+        .asset-group{{margin:10px 0;border-radius:8px;overflow:hidden;box-shadow:0 2px 5px rgba(0,0,0,.1)}}
+        .asset-header{{padding:18px 20px;color:white;font-size:1.3em;font-weight:bold;cursor:pointer;
+                        display:flex;justify-content:space-between;align-items:center;transition:opacity .2s}}
+        .asset-header:hover{{opacity:.9}}
+        .asset-header.network{{background:linear-gradient(135deg,#4facfe,#00f2fe)}}
+        .asset-header.credentials{{background:linear-gradient(135deg,#ff6b6b,#ee5a52)}}
+        .asset-header.files{{background:linear-gradient(135deg,#feca57,#ff9ff3)}}
+        .asset-header.folders{{background:linear-gradient(135deg,#48dbfb,#0abde3)}}
+        .asset-header.emails{{background:linear-gradient(135deg,#a8edea,#fed6e3);color:#333}}
+        .asset-header.office_meta{{background:linear-gradient(135deg,#fd9644,#e67e22);color:white}}
+        .asset-content{{max-height:0;overflow:hidden;transition:max-height .3s ease-out}}
+        .asset-content.expanded{{max-height:700px;overflow-y:auto}}
+        .priority-section{{margin:15px;border-radius:6px;border:1px solid #e9ecef;overflow:hidden}}
+        .priority-header{{padding:10px 15px;font-weight:bold;color:white;font-size:1em}}
+        .priority-header.high{{background:#dc3545}}
+        .priority-header.med{{background:#ffc107;color:#212529}}
+        .priority-header.low{{background:#17a2b8}}
+        .finding-item{{padding:14px;border-bottom:1px solid #f1f3f4}}
+        .finding-item:hover{{background:#f8f9fa}}
+        .finding-item:last-child{{border-bottom:none}}
+        .finding-value{{font-weight:bold;color:#2c3e50;margin-bottom:6px;background:#fff3cd;
+                         padding:6px 10px;border-radius:4px;border-left:4px solid #ffc107;
+                         word-break:break-all}}
+        .finding-source{{color:#6c757d;font-family:monospace;font-size:.85em;margin-bottom:4px}}
+        .finding-context{{background:#f8f9fa;padding:6px 10px;border-radius:4px;
+                           font-family:monospace;font-size:.82em;color:#495057;
+                           border-left:3px solid #007bff;white-space:pre-wrap;word-break:break-all}}
+        .toggle-icon{{font-size:1.1em;transition:transform .3s}}
+        .toggle-icon.expanded{{transform:rotate(180deg)}}
+        .timestamp{{text-align:center;padding:16px;color:#6c757d;font-size:.85em;
+                     border-top:1px solid #dee2e6}}
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🔍 SMB Scanner Results</h1>
-            <div class="subtitle">Sensitive Data Discovery Report</div>
-        </div>
-        
-        <div class="scan-info">
-            <div><span class="label">Target:</span><span class="value">{scan_info['target_display']}</span></div>
-            <div><span class="label">Command:</span><span class="value">{scan_info['command']}</span></div>
-            <div><span class="label">Scan Path:</span><span class="value">{scan_info['scan_path']}</span></div>
-            <div><span class="label">Authentication:</span><span class="value">{scan_info['auth_info']}</span></div>
-        </div>
-        
-        <div class="stats">
-            <div class="stat">
-                <div class="stat-number" style="color: #ff6b6b;">{len(high_results)}</div>
-                <div class="stat-label">High Priority</div>
-            </div>
-            <div class="stat">
-                <div class="stat-number" style="color: #feca57;">{len(med_results)}</div>
-                <div class="stat-label">Medium Priority</div>
-            </div>
-            <div class="stat">
-                <div class="stat-number" style="color: #48dbfb;">{len(low_results)}</div>
-                <div class="stat-label">Low Priority</div>
-            </div>
-            <div class="stat">
-                <div class="stat-number" style="color: #667eea;">{len(self.results)}</div>
-                <div class="stat-label">Total Files</div>
-            </div>
-        </div>
-        
-        <div class="content-area">
-            <div class="summary-section">
-                <h2>📊 Scan Summary</h2>
-                <div class="summary-grid">
-                    <div class="summary-item">
-                        <div class="summary-number">{len(high_results)}</div>
-                        <div class="summary-label">High Priority Files</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-number">{len(med_results)}</div>
-                        <div class="summary-label">Medium Priority Files</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-number">{len(low_results)}</div>
-                        <div class="summary-label">Low Priority Files</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-number">{len(self.results)}</div>
-                        <div class="summary-label">Total Files Scanned</div>
-                    </div>
-                </div>
-            </div>
-            
-            <h2>🔍 Detailed Findings by Category</h2>
-            {self._generate_asset_groups_html(asset_groups)}
-        </div>
-        
-        <div class="timestamp">
-            Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        </div>
+<div class="container">
+    <div class="header">
+        <h1>🔍 SMB Scanner Results</h1>
+        <div style="margin-top:8px;opacity:.9">{info['target_display']}</div>
     </div>
-    
-    <script>
-        function toggleAssetGroup(groupId) {{
-            const content = document.getElementById(groupId + '-content');
-            const icon = document.getElementById(groupId + '-icon');
-            const header = document.getElementById(groupId + '-header');
-            
-            if (content.classList.contains('expanded')) {{
-                content.classList.remove('expanded');
-                icon.classList.remove('expanded');
-                header.style.borderRadius = '8px';
-            }} else {{
-                content.classList.add('expanded');
-                icon.classList.add('expanded');
-                header.style.borderRadius = '8px 8px 0 0';
-            }}
+    <div class="scan-info">
+        <div><span class="label">Target:</span><span class="value">{info['target_display']}</span></div>
+        <div><span class="label">Command:</span><span class="value">{info['command']}</span></div>
+        <div><span class="label">Auth:</span><span class="value">{info['auth_info']}</span></div>
+    </div>
+    <div class="stats">
+        <div class="stat"><div class="stat-number" style="color:#dc3545">{len(high_r)}</div><div class="stat-label">High</div></div>
+        <div class="stat"><div class="stat-number" style="color:#ffc107">{len(med_r)}</div><div class="stat-label">Medium</div></div>
+        <div class="stat"><div class="stat-number" style="color:#17a2b8">{len(low_r)}</div><div class="stat-label">Low</div></div>
+        <div class="stat"><div class="stat-number" style="color:#e67e22">{len(office_meta_r)}</div><div class="stat-label">Office Meta</div></div>
+        <div class="stat"><div class="stat-number" style="color:#667eea">{len(self.results)}</div><div class="stat-label">Total</div></div>
+    </div>
+    <div class="content-area">
+        <div class="summary-section">
+            <h2>📊 Scan Summary</h2>
+            <div class="summary-grid">
+                <div class="summary-item"><div class="summary-number">{len(high_r)}</div><div class="summary-label">High Priority</div></div>
+                <div class="summary-item"><div class="summary-number">{len(med_r)}</div><div class="summary-label">Medium Priority</div></div>
+                <div class="summary-item"><div class="summary-number">{len(low_r)}</div><div class="summary-label">Low Priority</div></div>
+                <div class="summary-item"><div class="summary-number">{len(office_meta_r)}</div><div class="summary-label">Office Files w/ Metadata</div></div>
+                <div class="summary-item"><div class="summary-number">{len(self.results)}</div><div class="summary-label">Total Files</div></div>
+            </div>
+        </div>
+        <h2>🔍 Findings by Category</h2>
+        {self._generate_asset_groups_html(groups)}
+    </div>
+    <div class="timestamp">Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+</div>
+<script>
+function toggleAssetGroup(id) {{
+    const c = document.getElementById(id+'-content');
+    const i = document.getElementById(id+'-icon');
+    const expanded = c.classList.toggle('expanded');
+    i.classList.toggle('expanded', expanded);
+}}
+document.addEventListener('DOMContentLoaded', () => {{
+    document.querySelectorAll('.asset-group').forEach(g => {{
+        if (g.querySelector('.priority-header.high')) {{
+            const id = g.querySelector('.asset-header').getAttribute('onclick').match(/'([^']+)'/)[1];
+            toggleAssetGroup(id);
         }}
-        
-        // Auto-expand high priority groups
-        document.addEventListener('DOMContentLoaded', function() {{
-            const highPriorityGroups = document.querySelectorAll('.asset-group');
-            highPriorityGroups.forEach(group => {{
-                const hasHighPriority = group.querySelector('.priority-header.high');
-                if (hasHighPriority) {{
-                    const groupId = group.querySelector('.asset-header').getAttribute('onclick').match(/toggleAssetGroup\\('([^']+)'\\)/)[1];
-                    toggleAssetGroup(groupId);
-                }}
-            }});
-        }});
-    </script>
+    }});
+}});
+</script>
 </body>
-</html>
-        """
-        
-        # Write HTML file
+</html>"""
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            print(f"\n📄 HTML Summary generated: {output_file}")
+                f.write(html)
+            print(f'HTML report → {output_file}')
         except Exception as e:
-            print(f"Error generating HTML summary: {e}")
+            print(f'Error writing HTML: {e}')
 
-    def _build_scan_info(self):
-        """Build scan information for the HTML report."""
-        # Get unique targets and shares from results
-        targets = set()
-        shares = set()
-        for result in self.results:
-            targets.add(result.target)
-            shares.add(result.share)
-        
-        # Build target display
-        if len(targets) == 1:
-            target_display = list(targets)[0]
-        else:
-            target_display = f"Multiple targets: {', '.join(sorted(targets))}"
-        
-        # Build scan path
-        if len(shares) == 1:
-            scan_path = f"\\\\{list(targets)[0]}\\{list(shares)[0]}"
-        else:
-            scan_path = f"\\\\{list(targets)[0]}\\Multiple shares: {', '.join(sorted(shares))}"
-        
-        # Build command
-        command_parts = ["python smb_scanner.py"]
-        
-        if self.args.target:
-            command_parts.append(f'--target "{self.args.target}"')
-        elif self.args.targets_file:
-            command_parts.append(f'--targets-file "{self.args.targets_file}"')
-        elif self.args.path_unc:
-            command_parts.append(f'--path-unc "{self.args.path_unc}"')
-        elif self.args.mounted_root:
-            command_parts.append(f'--mounted-root "{self.args.mounted_root}"')
-        
-        if self.args.username:
-            command_parts.append(f'-u "{self.args.username}"')
-        if self.args.password:
-            command_parts.append(f'-p "{self.args.password}"')
-        
+    def _build_scan_info(self) -> Dict:
+        targets = {r.target for r in self.results}
+        shares  = {r.share  for r in self.results}
+        t_disp  = list(targets)[0] if len(targets) == 1 else f'Multiple ({len(targets)})'
+        cmd     = 'python smb_scanner.py'
+        if getattr(self.args, 'target', None):
+            cmd += f' --target "{self.args.target}"'
+        elif getattr(self.args, 'targets_file', None):
+            cmd += f' --targets-file "{self.args.targets_file}"'
+        elif getattr(self.args, 'mounted_root', None):
+            cmd += f' --mounted-root "{self.args.mounted_root}"'
+        if getattr(self.args, 'username', None):
+            cmd += f' -u "{self.args.username}"'
+        auth = f'User: {self.args.username}' if getattr(self.args, 'username', None) else 'Anonymous'
+        return {'target_display': t_disp, 'command': cmd, 'auth_info': auth,
+                'scan_path': f'\\\\{t_disp}\\{",".join(sorted(shares))}'}
 
-        
-        if self.args.include_shares:
-            command_parts.append(f'--include-shares "{self.args.include_shares}"')
-        if self.args.exclude_shares:
-            command_parts.append(f'--exclude-shares "{self.args.exclude_shares}"')
-        
-        command = ' '.join(command_parts)
-        
-        # Build authentication info
-        if self.args.username:
-            auth_info = f"Username: {self.args.username}"
-            if self.args.password:
-                auth_info += " (with password)"
-        else:
-            auth_info = "Anonymous access"
-        
-        return {
-            'target_display': target_display,
-            'command': command,
-            'scan_path': scan_path,
-            'auth_info': auth_info
+    def _organize_by_asset_type(self) -> Dict:
+        groups = {
+            'credentials': {'title': '🔑 Credentials & Tokens', 'results': []},
+            'network':     {'title': '🌐 Network Assets',        'results': []},
+            'office_meta': {'title': '🏢 Office Metadata Intel', 'results': []},
+            'files':       {'title': '📄 Sensitive Files',        'results': []},
+            'folders':     {'title': '📁 Sensitive Folders',      'results': []},
+            'emails':      {'title': '📧 Email Addresses',        'results': []},
         }
+        for r in self.results:
+            for v in r.actual_values:
+                if ':' not in v:
+                    continue
+                cat = v.split(':', 1)[0]
+                if cat in ('Cloud', 'Tokens', 'Secrets', 'DB_Connection', 'Domain_Users', 'Hebrew', 'Git_Credentials', 'AI_Services'):
+                    groups['credentials']['results'].append((v, r))
+                elif cat == 'Network_Addresses':
+                    groups['network']['results'].append((v, r))
+                elif cat == 'Emails':
+                    groups['emails']['results'].append((v, r))
+                elif cat == 'Shadow_Files':
+                    groups['files']['results'].append((v, r))
+                elif cat in ('OfficeMeta_High', 'OfficeMeta'):
+                    groups['office_meta']['results'].append((v, r))
+            if self.folder_re.search(r.path):
+                groups['folders']['results'].append((f'Sensitive_Folder:{r.path}', r))
+            if self.filename_re.search(r.path.split('\\')[-1]):
+                groups['files']['results'].append((f'Sensitive_File:{r.path.split(chr(92))[-1]}', r))
+        return groups
 
-    def _organize_by_asset_type(self):
-        """Organize findings by asset type categories."""
-        asset_groups = {
-            'network': {'title': '🌐 Network Assets (IP Addresses)', 'icon': '🌐', 'results': []},
-            'credentials': {'title': '🔑 Passwords & Tokens', 'icon': '🔑', 'results': []},
-            'files': {'title': '📄 Sensitive Files', 'icon': '📄', 'results': []},
-            'folders': {'title': '📁 Sensitive Folders', 'icon': '📁', 'results': []},
-            'emails': {'title': '📧 Email Addresses', 'icon': '📧', 'results': []}
-        }
-        
-        for result in self.results:
-            # Categorize by content patterns
-            for actual_value in result.actual_values:
-                if ':' in actual_value:
-                    category = actual_value.split(':', 1)[0]
-                    
-                    if category in ['Network_Addresses']:
-                        asset_groups['network']['results'].append((actual_value, result))
-                    elif category in ['Secrets', 'Cloud', 'DB_Connection', 'Domain_Users']:
-                        asset_groups['credentials']['results'].append((actual_value, result))
-                    elif category in ['Emails']:
-                        asset_groups['emails']['results'].append((actual_value, result))
-                    elif category in ['Shadow_Files']:
-                        asset_groups['files']['results'].append((actual_value, result))
-            
-            # Categorize by folder indicators (sensitive folders)
-            if any(pattern.search(result.path) for pattern in self.folder_regex):
-                asset_groups['folders']['results'].append(('Sensitive_Folder:' + result.path, result))
-            
-            # Categorize by filename keywords (sensitive files)
-            if any(pattern.search(result.path.split('\\')[-1]) for pattern in self.filename_regex):
-                asset_groups['files']['results'].append(('Sensitive_File:' + result.path.split('\\')[-1], result))
-        
-        return asset_groups
-
-    def _generate_asset_groups_html(self, asset_groups):
-        """Generate HTML for asset groups."""
-        html_parts = []
-        
-        for group_key, group_data in asset_groups.items():
-            if not group_data['results']:
+    def _generate_asset_groups_html(self, groups: Dict) -> str:
+        parts = []
+        for key, data in groups.items():
+            if not data['results']:
                 continue
-                
-            # Group by priority
-            high_items = [(v, r) for v, r in group_data['results'] if r.interesting == "HIGH"]
-            med_items = [(v, r) for v, r in group_data['results'] if r.interesting == "MED"]
-            low_items = [(v, r) for v, r in group_data['results'] if r.interesting == "LOW"]
-            
-            html_parts.append(f'''
+            high_i = [(v, r) for v, r in data['results'] if r.interesting == 'HIGH']
+            med_i  = [(v, r) for v, r in data['results'] if r.interesting == 'MED']
+            low_i  = [(v, r) for v, r in data['results'] if r.interesting == 'LOW']
+            parts.append(f'''
             <div class="asset-group">
-                <div class="asset-header {group_key}" onclick="toggleAssetGroup('{group_key}')" id="{group_key}-header">
-                    <span>{group_data['title']} ({len(group_data['results'])} items)</span>
-                    <span class="toggle-icon" id="{group_key}-icon">▼</span>
+                <div class="asset-header {key}" onclick="toggleAssetGroup('{key}')" id="{key}-header">
+                    <span>{data["title"]} ({len(data["results"])})</span>
+                    <span class="toggle-icon" id="{key}-icon">▼</span>
                 </div>
-                <div class="asset-content" id="{group_key}-content">
+                <div class="asset-content" id="{key}-content">
             ''')
-            
-            # High priority section
-            if high_items:
-                html_parts.append(f'''
+            for label, cls, items in (('🔥 HIGH', 'high', high_i), ('⚠️ MEDIUM', 'med', med_i), ('ℹ️ LOW', 'low', low_i)):
+                if items:
+                    parts.append(f'''
                     <div class="priority-section">
-                        <div class="priority-header high">🔥 HIGH PRIORITY ({len(high_items)} items)</div>
-                        {self._generate_findings_html(high_items)}
-                    </div>
-                ''')
-            
-            # Medium priority section
-            if med_items:
-                html_parts.append(f'''
-                    <div class="priority-section">
-                        <div class="priority-header med">⚠️ MEDIUM PRIORITY ({len(med_items)} items)</div>
-                        {self._generate_findings_html(med_items)}
-                    </div>
-                ''')
-            
-            # Low priority section
-            if low_items:
-                html_parts.append(f'''
-                    <div class="priority-section">
-                        <div class="priority-header low">ℹ️ LOW PRIORITY ({len(low_items)} items)</div>
-                        {self._generate_findings_html(low_items)}
-                    </div>
-                ''')
-            
-            html_parts.append('</div></div>')
-        
-        return ''.join(html_parts)
+                        <div class="priority-header {cls}">{label} ({len(items)})</div>
+                        {self._generate_findings_html(items)}
+                    </div>''')
+            parts.append('</div></div>')
+        return ''.join(parts)
 
-    def _generate_findings_html(self, items):
-        """Generate HTML for findings list."""
+    def _generate_findings_html(self, items: List[Tuple]) -> str:
         if not items:
-            return '<div class="empty-section">No findings</div>'
-        
-        html_parts = []
-        for actual_value, result in items:
-            # Extract the actual sensitive value
-            if ':' in actual_value:
-                value_part = actual_value.split(':', 1)[1]
-            else:
-                value_part = actual_value
-            
-            source_path = f"{result.target}\\{result.share}\\{result.path}"
-            file_path = f"file:///{result.target}/{result.share}/{result.path}".replace('\\', '/')
-            context = self.create_targeted_snippet(result.content_snippet, value_part)
-            
-            html_parts.append(f'''
+            return '<div style="padding:20px;color:#6c757d;font-style:italic">No findings</div>'
+        parts = []
+        for val, r in items:
+            value_part = val.split(':', 1)[1] if ':' in val else val
+            src        = f'\\\\{r.target}\\{r.share}\\{r.path}'
+            ctx        = self._targeted_snippet(r.content_snippet, value_part)
+            # For office meta findings, show a compact metadata summary if no snippet
+            if not ctx and r.ooxml_meta:
+                meta_items = [f'{k}: {v}' for k, v in r.ooxml_meta.items()
+                              if k in ('creator', 'lastModifiedBy', 'Company', 'Manager',
+                                       'Template', 'Application', 'AppVersion', 'revision')]
+                if meta_items:
+                    ctx = ' | '.join(meta_items)
+            parts.append(f'''
             <div class="finding-item">
                 <div class="finding-value">🔍 {value_part}</div>
-                <div class="finding-source">
-                    📁 Source: <a href="{file_path}" target="_blank">{source_path}</a>
-                </div>
-                <div class="finding-context">{context}</div>
-            </div>
-            ''')
-        
-        return ''.join(html_parts)
+                <div class="finding-source">📁 {src}</div>
+                {'<div class="finding-context">' + ctx + '</div>' if ctx else ''}
+            </div>''')
+        return ''.join(parts)
+
+
+# ── Shared tqdm-aware print ────────────────────────────────────────────────────
+
+def _write(msg: str):
+    if HAS_TQDM:
+        tqdm.write(msg)
+    else:
+        print(msg)
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SMB Sensitive Strings Scanner - Scan SMB shares for sensitive files and secrets (Interactive mode always enabled - Press 'S' to skip folders)",
+        description='SMB Sensitive Strings Scanner v2 — impacket edition',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Scan all shares on a host
+  # Single host (enumerate all shares)
   python smb_scanner.py --target 10.0.0.5
-  python smb_scanner.py --target \\\\10.0.0.5
-  
-  # Scan specific share
-  python smb_scanner.py --target \\\\10.0.0.5\\Users
-  
-  # Scan specific path within a share
-  python smb_scanner.py --target \\\\10.0.0.5\\Users\\Public
-  
-  # With authentication
-  python smb_scanner.py --target 10.0.0.5 -u CORP\\alice -p "S3cret!"
-  
-  # Direct UNC path (alternative)
-  python smb_scanner.py --path-unc "\\\\10.0.0.5\\Users\\Public"
-  
-  # Multiple targets from file
-  python smb_scanner.py --targets-file hosts.txt --include-shares "Users,Shared"
-  
-Note: Interactive mode is always enabled. Press 'S' during scanning to skip the current folder.
-Content scanning is always enabled by default to find sensitive data.
-        """
+
+  # CIDR subnet — auto-discovers hosts with port 445 open
+  python smb_scanner.py --target 10.0.0.0/24
+
+  # With credentials
+  python smb_scanner.py --target 10.0.0.5 -u CORP\\\\alice -p 'S3cret!'
+
+  # Specific share
+  python smb_scanner.py --target '\\\\\\\\10.0.0.5\\\\Users'
+
+  # Multiple targets from file (one IP or UNC per line, # = comment)
+  python smb_scanner.py --targets-file hosts.txt -u admin -p pass
+
+  # Already-mounted path (no impacket needed)
+  python smb_scanner.py --mounted-root /mnt/smb_share
+
+  # Parallel scan with threads
+  python smb_scanner.py --target 10.0.0.0/24 --threads 10
+
+  # Output reports
+  python smb_scanner.py --target 10.0.0.5 --csv out.csv --jsonl out.jsonl
+""",
     )
-    
-    # Target specification
-    target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument('--target', help='Target host or UNC path. Examples: 10.0.0.5, \\\\10.0.0.5, \\\\10.0.0.5\\Share, \\\\10.0.0.5\\Share\\path')
-    target_group.add_argument('--targets-file', help='File containing list of target hosts')
-    target_group.add_argument('--path-unc', help='Direct UNC path to scan (alternative to --target)')
-    target_group.add_argument('--mounted-root', help='Mounted CIFS path for Linux/Mac')
-    
-    # Authentication
-    parser.add_argument('-u', '--username', help='Username (DOMAIN\\user or user@domain)')
-    parser.add_argument('-p', '--password', help='Password (use empty quotes for blank password)')
-    
-    # Share filtering
-    parser.add_argument('--include-shares', help='Comma-separated list of shares to include')
-    parser.add_argument('--exclude-shares', help='Comma-separated list of shares to exclude')
-    parser.add_argument('--include-admin-shares', action='store_true', help='Include admin shares (C$, ADMIN$, etc.)')
-    
-    # Directory and file filtering
-    parser.add_argument('--include-dirs', nargs='+', help='Regex patterns for directories to include')
-    parser.add_argument('--exclude-dirs', nargs='+', help='Regex patterns for directories to exclude')
-    parser.add_argument('--include-ext', nargs='+', help='File extensions to include')
-    parser.add_argument('--exclude-ext', nargs='+', help='File extensions to exclude')
-    parser.add_argument('--max-depth', type=int, default=10, help='Maximum directory depth to scan')
-    
-    # Content scanning (always enabled by default)
-    parser.add_argument('--deepscan-max-bytes', type=int, default=4*1024*1024, help='Maximum bytes to read for deep scan (default: 4MB)')
-    parser.add_argument('--quickpeek', action='store_true', help='Enable quick peek for OOXML files')
-    parser.add_argument('--quickpeek-max-bytes', type=int, default=8*1024*1024, help='Maximum bytes to read for quick peek (default: 8MB)')
-    
-    # Output options
-    parser.add_argument('--jsonl', help='Output file for JSONL format')
-    parser.add_argument('--csv', help='Output file for CSV format')
-    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--dry-run', action='store_true', help='Show what would be scanned without actually scanning')
-    
-    # Performance
-    parser.add_argument('--threads', type=int, default=1, help='Number of threads (default: 1)')
-    parser.add_argument('--skip-path-defaults', action='store_true', help='Skip default path exclusions')
-    
+
+    # Target
+    tgt = parser.add_mutually_exclusive_group(required=True)
+    tgt.add_argument('--target',       help='IP, CIDR (10.0.0.0/24), hostname, or UNC path')
+    tgt.add_argument('--targets-file', help='File with one target per line')
+    tgt.add_argument('--mounted-root', help='Already-mounted path (macOS/Linux fallback)')
+
+    # Auth
+    parser.add_argument('-u', '--username', help='DOMAIN\\\\user or user@domain')
+    parser.add_argument('-p', '--password', help='Password (use "" for blank)')
+
+    # Share filters
+    parser.add_argument('--include-shares',       help='Comma-separated shares to include')
+    parser.add_argument('--exclude-shares',       help='Comma-separated shares to exclude')
+    parser.add_argument('--include-admin-shares', action='store_true',
+                        help='Include admin shares (C$, ADMIN$, etc.)')
+
+    # Dir / file filters
+    parser.add_argument('--include-dirs',  nargs='+', help='Only recurse dirs matching these regex patterns')
+    parser.add_argument('--exclude-dirs',  nargs='+', help='Skip dirs matching these regex patterns')
+    parser.add_argument('--include-ext',   nargs='+', help='Only scan files with these extensions (.env .json)')
+    parser.add_argument('--exclude-ext',   nargs='+', help='Skip files with these extensions')
+    parser.add_argument('--max-depth',     type=int,  default=10,   help='Max directory depth (default: 10)')
+    parser.add_argument('--max-files-per-dir', type=int, default=1000, help='Max files per directory (default: 1000)')
+    parser.add_argument('--no-skip-defaults', action='store_true',
+                        help='Disable built-in skip-path list (scan everything)')
+
+    # Scan settings
+    parser.add_argument('--deepscan-max-bytes',  type=int, default=4*1024*1024,
+                        help='Max bytes read per DeepScan file (default: 4MB)')
+    parser.add_argument('--quickpeek-max-bytes', type=int, default=1*1024*1024,
+                        help='Max bytes read per QuickPeek file (default: 1MB)')
+    parser.add_argument('--threads', type=int, default=1,
+                        help='Parallel share scanners per host (default: 1)')
+    parser.add_argument('--host-timeout', type=int, default=None,
+                        help='Max seconds to spend on a single host before moving on (e.g. 300)')
+    parser.add_argument('--host-threads', type=int, default=1,
+                        help='Parallel hosts to scan simultaneously (default: 1)')
+    parser.add_argument('--no-office', action='store_true',
+                        help='Skip full content scan of Office files; still extract metadata (creator, company, etc.)')
+    parser.add_argument('--no-office-meta', action='store_true',
+                        help='Skip Office files entirely including metadata extraction')
+    parser.add_argument('--quick', action='store_true',
+                        help='Quick mode: metadata-only for office files, limit depth to 4, 128KB read limit, skip common junk dirs')
+
+    # Output
+    parser.add_argument('--csv',   help='Save results to CSV file')
+    parser.add_argument('--jsonl', help='Save results to JSONL file')
+
+    # Misc
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('--dry-run',       action='store_true', help='Parse args only, no scanning')
+
     args = parser.parse_args()
-    
-    # Validate arguments
+
+    # Normalise ext lists
     if args.include_ext:
-        args.include_ext = [ext.lower() if not ext.startswith('.') else ext.lower() for ext in args.include_ext]
+        args.include_ext = {e if e.startswith('.') else '.' + e for e in args.include_ext}
     if args.exclude_ext:
-        args.exclude_ext = [ext.lower() if not ext.startswith('.') else ext.lower() for ext in args.exclude_ext]
-    
-    # Create scanner and run
+        args.exclude_ext = {e if e.startswith('.') else '.' + e for e in args.exclude_ext}
+
+    # --quick: opinionated fast-scan defaults
+    if args.quick:
+        args.max_depth             = min(args.max_depth, 4)
+        args.deepscan_max_bytes    = min(args.deepscan_max_bytes, 128 * 1024)
+        args.quickpeek_max_bytes   = min(args.quickpeek_max_bytes, 64 * 1024)
+        args.max_files_per_dir     = min(args.max_files_per_dir, 300)
+        args.no_office             = True
+        args.no_office_content     = True
+        if not args.host_timeout:
+            args.host_timeout = 120  # 2 min max per host in quick mode
+        # Skip common junk dirs automatically
+        junk = [
+            r'^Windows$', r'^WinSxS$', r'^SoftwareDistribution$',
+            r'^Temp$', r'^Tmp$', r'^Cache$', r'^Installer$',
+            r'^MSOCache$', r'^assembly$', r'^GAC_MSIL$',
+            r'^en-US$', r'^en$', r'^x86$', r'^x64$',
+            r'^fonts$', r'^Fonts$', r'^help$', r'^Help$',
+            r'^Sample\s', r'^desktop\.ini$',
+        ]
+        existing = args.exclude_dirs or []
+        args.exclude_dirs = existing + junk
+
+    # --no-office: skip content scan but keep metadata extraction (unless --no-office-meta)
+    if getattr(args, 'no_office', False):
+        args.no_office_content = True
+
+    # --no-office-meta: skip office files entirely (fastest, no metadata)
+    if getattr(args, 'no_office_meta', False):
+        if not args.exclude_ext:
+            args.exclude_ext = set()
+        args.exclude_ext |= {'.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm', '.vsdx', '.one',
+                              '.doc', '.xls', '.ppt'}
+
+    if args.dry_run:
+        print('DRY RUN — args parsed OK.')
+        return
+
     scanner = SMBScanner(args)
     scanner.run()
 
-if __name__ == "__main__":
-    main() 
+
+if __name__ == '__main__':
+    main()
